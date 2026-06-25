@@ -11,11 +11,12 @@ def suggest_queries(queries: List[str]) -> dict:
         queries: The list of suggested queries or choices to show.
     """
     logger.info(f"[knowledge_agent] Suggesting queries: {queries}")
+    context = hubscape_adk.get_context()
+    context.actions.append({
+        "type": "SET_SUGGESTIONS",
+        "queries": queries
+    })
     return {
         "status": "success",
-        "message": "Here are some options to help clarify your request:",
-        "system_action": {
-            "type": "SUGGEST_QUERIES",
-            "queries": queries
-        }
+        "message": f"Suggested options presented: {queries}"
     }
