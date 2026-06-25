@@ -29,7 +29,12 @@ cmd = [
 
 env = os.environ.copy()
 venv_bin = os.path.dirname(sys.executable)
-env["PATH"] = f"{venv_bin}{os.path.pathsep}{env.get('PATH', '')}"
+# Add both current venv bin and the host-agent venv bin (which has uv) to PATH
+host_agent_venv_bin = "/Users/seanneubert/Documents/Projects/core-agents/host-agent/venv/bin"
+paths = [venv_bin]
+if os.path.exists(host_agent_venv_bin):
+    paths.append(host_agent_venv_bin)
+env["PATH"] = os.path.pathsep.join(paths) + os.path.pathsep + env.get("PATH", "")
 
 print(f"Executing: {' '.join(cmd)}")
 subprocess.run(cmd, env=env, check=True)
