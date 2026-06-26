@@ -37,6 +37,10 @@ async def search_knowledge(query: str) -> dict:
         location = os.environ.get("REGION", "us-central1")
         project_id = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT") or "hubscape-geap"
         
+        # Prevent API keys in the environment from overriding OIDC/ADC credentials
+        os.environ.pop("GEMINI_API_KEY", None)
+        os.environ.pop("GOOGLE_API_KEY", None)
+
         from google.api_core.client_options import ClientOptions
         client_options = ClientOptions(api_endpoint=f"{location}-aiplatform.googleapis.com")
         client = aiplatform_v1beta1.VertexRagServiceClient(client_options=client_options)
