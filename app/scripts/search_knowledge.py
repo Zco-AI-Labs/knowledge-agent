@@ -1,7 +1,7 @@
 import logging
 import asyncio
 import os
-from google.cloud import aiplatform_v1beta1
+from google.cloud import aiplatform_v1
 import hubscape_adk
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ async def search_knowledge(query: str) -> dict:
 
         from google.api_core.client_options import ClientOptions
         client_options = ClientOptions(api_endpoint=f"{location}-aiplatform.googleapis.com")
-        client = aiplatform_v1beta1.VertexRagServiceClient(
+        client = aiplatform_v1.VertexRagServiceClient(
             client_options=client_options,
             credentials=credentials
         )
@@ -74,26 +74,29 @@ async def search_knowledge(query: str) -> dict:
         # Serverless RAG does not support query-time metadata filtering.
         # We query globally with an increased candidate limit and filter post-retrieval.
         candidate_limit = 20
-        query_obj = aiplatform_v1beta1.types.RagQuery(
+        retrieval_config = aiplatform_v1.types.RagRetrievalConfig(
+            top_k=candidate_limit
+        )
+        query_obj = aiplatform_v1.types.RagQuery(
             text=query,
-            similarity_top_k=candidate_limit
+            rag_retrieval_config=retrieval_config
         )
         
-        rag_resource = aiplatform_v1beta1.types.RetrieveContextsRequest.VertexRagStore.RagResource(
+        rag_resource = aiplatform_v1.types.RetrieveContextsRequest.VertexRagStore.RagResource(
             rag_corpus=corpus_id
         )
-        vertex_rag_store = aiplatform_v1beta1.types.RetrieveContextsRequest.VertexRagStore(
+        vertex_rag_store = aiplatform_v1.types.RetrieveContextsRequest.VertexRagStore(
             rag_resources=[rag_resource]
         )
         
         parent_location = f"projects/{project_id}/locations/{location}"
-        request = aiplatform_v1beta1.types.RetrieveContextsRequest(
+        request = aiplatform_v1.types.RetrieveContextsRequest(
             parent=parent_location,
             vertex_rag_store=vertex_rag_store,
             query=query_obj
         )
         
-        logger.info(f"[knowledge_agent] querying RAG parent_location: {parent_location}, corpus_id: {corpus_id}, query_obj similarity_top_k: {candidate_limit}")
+        logger.info(f"[knowledge_agent] querying RAG parent_location: {parent_location}, corpus_id: {corpus_id}, query_obj top_k: {candidate_limit}")
         response = await asyncio.to_thread(
             client.retrieve_contexts,
             request=request
