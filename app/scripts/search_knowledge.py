@@ -18,7 +18,7 @@ async def search_knowledge(query: str) -> dict:
     hub_id = context.auth.hub_id
     org_id = context.auth.org_id
     
-    if not hub_id or not org_id:
+    if not hub_id and not org_id:
         return {"status": "error", "message": "No Hub ID or Org ID found in context."}
 
     try:
@@ -67,18 +67,25 @@ async def search_knowledge(query: str) -> dict:
             query=query_obj
         )
         
+        logger.info(f"[knowledge_agent] querying RAG parent_location: {parent_location}, corpus_id: {corpus_id}, query_obj similarity_top_k: {candidate_limit}")
         response = await asyncio.to_thread(
             client.retrieve_contexts,
             request=request
         )
         
+        contexts_list = getattr(response, "contexts", None)
+        contexts = getattr(contexts_list, "contexts", []) if contexts_list else []
+        logger.info(f"[knowledge_agent] retrieve_contexts returned {len(contexts)} contexts")
+        
         # 1. Collect file IDs from contexts
         file_ids = []
-        for context_item in response.contexts.contexts:
+        for i, context_item in enumerate(contexts):
+            fid = ""
             if hasattr(context_item, 'chunk') and context_item.chunk:
                 fid = getattr(context_item.chunk, 'file_id', '')
-                if fid:
-                    file_ids.append(fid)
+            logger.info(f"[knowledge_agent] context {i+1}: file_id='{fid}', text_len={len(context_item.text) if hasattr(context_item, 'text') else 0}")
+            if fid:
+                file_ids.append(fid)
                     
         # 2. Batch-query Firestore to resolve document metadata and verify tenant ownership
         registry_map = {}
@@ -88,21 +95,24 @@ async def search_knowledge(query: str) -> dict:
                 f"projects/{project_id}/locations/{location}/ragCorpora/{corpus_id_num}/ragFiles/{fid}"
                 for fid in set(file_ids)
             ]
+            logger.info(f"[knowledge_agent] Firestore batch lookup full_ids: {full_ids}")
             
             chunked_ids = [full_ids[i:i + 30] for i in range(0, len(full_ids), 30)]
             for batch in chunked_ids:
                 registry_docs = await asyncio.to_thread(
                     lambda: db_client.collection('rag_knowledge').where('ragFileId', 'in', batch).get()
                 )
+                logger.info(f"[knowledge_agent] Firestore batch lookup returned {len(registry_docs)} documents")
                 for rdoc in registry_docs:
                     rdata = rdoc.to_dict()
                     fid = rdata.get('ragFileId', '').split('/')[-1]
                     if fid:
                         registry_map[fid] = rdata
+                        logger.info(f"[knowledge_agent] Mapped fid '{fid}' -> title: '{rdata.get('title')}', ownerId: '{rdata.get('ownerId')}', orgId: '{rdata.get('orgId')}'")
                         
         # 3. Apply post-retrieval filtering and enrich results
         results = []
-        for context_item in response.contexts.contexts:
+        for context_item in contexts:
             fid = ""
             if hasattr(context_item, 'chunk') and context_item.chunk:
                 fid = getattr(context_item.chunk, 'file_id', '')
@@ -119,6 +129,7 @@ async def search_knowledge(query: str) -> dict:
                 (hub_id and owner_id == hub_id) or
                 (org_id and doc_org_id == org_id)
             )
+            logger.info(f"[knowledge_agent] context check: fid='{fid}', ownerId='{owner_id}', doc_org_id='{doc_org_id}', context_hub_id='{hub_id}', context_org_id='{org_id}' -> is_allowed={is_allowed}")
             if not is_allowed:
                 continue
                 
