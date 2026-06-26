@@ -1,6 +1,9 @@
 import logging
 import asyncio
 import os
+# NOTE: Using v1beta1 specifically for RAG retrieval because the GA v1 
+# RagChunk schema lacks the file_id and chunk_id metadata fields required 
+# for our Firestore tenant isolation and validation checks.
 from google.cloud import aiplatform_v1beta1
 import hubscape_adk
 
