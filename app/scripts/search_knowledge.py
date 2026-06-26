@@ -41,9 +41,35 @@ async def search_knowledge(query: str) -> dict:
         os.environ.pop("GEMINI_API_KEY", None)
         os.environ.pop("GOOGLE_API_KEY", None)
 
+        # Resolve credentials using metadata server to prevent 401 Unauthenticated inside Vertex container
+        from google.oauth2.credentials import Credentials
+        import google.auth
+        import httpx as httpx_sync
+
+        credentials = None
+        try:
+            meta_url = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+            resp = httpx_sync.get(meta_url, headers={"Metadata-Flavor": "Google"}, timeout=2.0)
+            if resp.status_code == 200:
+                tok = resp.json().get("access_token")
+                if tok:
+                    logger.info("[knowledge_agent] Resolved access token from Metadata Server.")
+                    credentials = Credentials(tok)
+        except Exception as e:
+            logger.debug(f"[knowledge_agent] Metadata Server token request failed: {e}")
+
+        if not credentials:
+            logger.info("[knowledge_agent] Falling back to default Application Credentials.")
+            credentials, _ = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+
         from google.api_core.client_options import ClientOptions
         client_options = ClientOptions(api_endpoint=f"{location}-aiplatform.googleapis.com")
-        client = aiplatform_v1beta1.VertexRagServiceClient(client_options=client_options)
+        client = aiplatform_v1beta1.VertexRagServiceClient(
+            client_options=client_options,
+            credentials=credentials
+        )
         
         # Serverless RAG does not support query-time metadata filtering.
         # We query globally with an increased candidate limit and filter post-retrieval.
