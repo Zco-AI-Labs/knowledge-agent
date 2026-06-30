@@ -9,6 +9,7 @@ import hubscape_adk
 
 logger = logging.getLogger(__name__)
 
+@hubscape_adk.require_tool_privilege
 async def search_knowledge(query: str) -> dict:
     """Searches the Hubscape internal Shared RAG Corpus for answers matching a query.
 
