@@ -29,7 +29,7 @@ from app.app_utils.vertex_gemini import get_model
 root_agent = AdkAgent(
     model=get_model("gemini-2.5-flash"),
     name='knowledge_agent',
-    description='Managed GEAP agent for RAG knowledge searches.',
+    description='Answers user questions by searching the Shared RAG corpus of scraped knowledge, which contains website content, uploaded files, and YouTube video transcripts.',
     instruction=system_instruction,
     tools=tools
 )
