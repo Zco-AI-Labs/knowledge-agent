@@ -38,17 +38,25 @@ jobs:
           GCP_LOCATION: ${{ vars.GCP_LOCATION || 'us-central1' }}
           GCP_STAGING_BUCKET: ${{ secrets.GCP_STAGING_BUCKET || 'hubscape-geap-reasoning-engines' }}
         run: |
+          REPO_DIR="$(basename "$(pwd)")"
+          NORM_DIR="$(echo "$REPO_DIR" | tr '-' '_')"
           if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
             PARENT_DIR="$(cd .. && pwd)"
             cp "$GOOGLE_APPLICATION_CREDENTIALS" "$PARENT_DIR/gha-creds-temp.json"
             export GOOGLE_APPLICATION_CREDENTIALS="$PARENT_DIR/gha-creds-temp.json"
           fi
           cd ..
-          mv knowledge-agent knowledge_agent
-          cd knowledge_agent
+          if [ "$REPO_DIR" != "$NORM_DIR" ]; then
+            mv "$REPO_DIR" "$NORM_DIR"
+          fi
+          cd "$NORM_DIR"
+          echo "from app.core.agent_runtime_app import agent_runtime, AgentEngineApp" > app/agent_runtime_app.py
+          export PYTHONPATH="$(pwd)"
           python deploy.py
           cd ..
-          mv knowledge_agent knowledge-agent
+          if [ "$REPO_DIR" != "$NORM_DIR" ]; then
+            mv "$NORM_DIR" "$REPO_DIR"
+          fi
           if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
             rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
           fi

@@ -16,8 +16,9 @@ import sys
 import os
 # Ensure standard imports share the same module instance
 app_dir = os.path.dirname(os.path.abspath(__file__))
-if app_dir not in sys.path:
-    sys.path.insert(0, app_dir)
+parent_dir = os.path.dirname(app_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
 
 # Extract pyopenssl and monkeypatch PyOpenSSLContext immediately to prevent context mutation errors
 try:
@@ -66,13 +67,45 @@ from google.adk.sessions import InMemorySessionService
 from google.cloud import logging as google_cloud_logging
 from vertexai.preview.reasoning_engines import A2aAgent
 
-import hubscape_adk
+from app.core import hubscape_adk
 from app.agent import app as adk_app
 from app.app_utils.telemetry import setup_telemetry
 from app.app_utils.typing import Feedback
 
 # Load environment variables from .env file at runtime
 load_dotenv()
+
+def _load_privileges() -> dict:
+    import json
+    privileges_data = {}
+    try:
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(app_dir)
+        privileges_path = os.path.join(parent_dir, "privileges.json")
+        if os.path.exists(privileges_path):
+            with open(privileges_path, "r") as pf:
+                privileges_data = json.load(pf)
+    except Exception:
+        pass
+    return privileges_data
+
+def _load_privileges_without_tools() -> dict:
+    privileges_data = _load_privileges()
+    if not privileges_data:
+        return {}
+    filtered_data = {}
+    if "privileges" in privileges_data:
+        filtered_data["privileges"] = {}
+        for role_id, role_info in privileges_data["privileges"].items():
+            if isinstance(role_info, dict):
+                filtered_data["privileges"][role_id] = {
+                    k: v for k, v in role_info.items() if k != "tools"
+                }
+            else:
+                filtered_data["privileges"][role_id] = role_info
+    else:
+        filtered_data = privileges_data
+    return filtered_data
 
 class ActionInterceptingEventQueue(EventQueue):
     def __init__(self, target_queue: EventQueue, remote_context):
@@ -115,6 +148,7 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
         import json
         import uuid
         from datetime import datetime, timezone
+        from app.agent import root_agent
         
         metadata = context.metadata or {}
         
@@ -123,7 +157,8 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
         hub_id = metadata.get("hubId") or metadata.get("hub_id")
         mode = metadata.get("mode") or "none"
         
-        agent_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/Zco-AI-Labs/knowledge-agent"))
+        agent_name = root_agent.name.replace('_', '-') if root_agent and hasattr(root_agent, "name") else "custom-agent"
+        agent_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/Zco-AI-Labs/{agent_name}"))
         from app.app_utils.env_resolver import get_project_id
         project_id = get_project_id()
         
@@ -138,7 +173,6 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
         
         interceptor = ActionInterceptingEventQueue(event_queue, remote_ctx)
         
-        from app.agent import root_agent
         base_instruction = root_agent.instruction or ""
         
         # Inject Active Session Context securely at the top of the prompt
@@ -314,21 +348,37 @@ class AgentEngineApp(A2aAgent):
 
     @staticmethod
     async def build_agent_card(app: App) -> AgentCard:
+        agent_name = app.root_agent.name.replace('_', '-') if app.root_agent and hasattr(app.root_agent, "name") else "custom-agent"
+        agent_desc = app.root_agent.description if app.root_agent and hasattr(app.root_agent, "description") else "Custom Agent"
+        
+        extensions = [
+            AgentExtension(
+                uri="https://google.github.io/adk-docs/a2a/a2a-extension/",
+                description="Ability to use the new agent executor implementation",
+            )
+        ]
+        privileges_data = _load_privileges_without_tools()
+        if privileges_data:
+            extensions.append(
+                AgentExtension(
+                    uri="https://hubscape.io/extensions/privileges",
+                    description="Workspace role-based privileges matrix",
+                    params=privileges_data
+                )
+            )
+
         agent_card_builder = AgentCardBuilder(
             agent=app.root_agent,
             capabilities=AgentCapabilities(
                 streaming=False,
-                extensions=[
-                    AgentExtension(
-                        uri="https://google.github.io/adk-docs/a2a/a2a-extension/",
-                        description="Ability to use the new agent executor implementation",
-                    ),
-                ],
+                extensions=extensions,
             ),
             rpc_url="http://localhost:9999/",
             agent_version=os.getenv("AGENT_VERSION", "0.1.0"),
         )
         agent_card = await agent_card_builder.build()
+        agent_card.name = agent_name
+        agent_card.description = agent_desc
         agent_card.preferred_transport = TransportProtocol.http_json  # Http Only.
         agent_card.supports_authenticated_extended_card = True
         return agent_card
@@ -365,10 +415,40 @@ class AgentEngineApp(A2aAgent):
         """
         from app.agent import app as adk_app
         root_agent = getattr(adk_app, "root_agent", None)
+        agent_name = root_agent.name.replace('_', '-') if root_agent and hasattr(root_agent, "name") else "custom-agent"
+        agent_desc = root_agent.description if root_agent and hasattr(root_agent, "description") else "Custom Agent"
+        
+        extensions = [
+            {
+                "uri": "https://google.github.io/adk-docs/a2a/a2a-extension/",
+                "description": "Ability to use the new agent executor implementation"
+            }
+        ]
+        privileges_data = _load_privileges_without_tools()
+        if privileges_data:
+            extensions.append({
+                "uri": "https://hubscape.io/extensions/privileges",
+                "description": "Workspace role-based privileges matrix",
+                "params": privileges_data
+            })
+
         card_dict = {
-            "name": getattr(root_agent, "name", "knowledge-agent"),
-            "description": getattr(root_agent, "description", "Knowledge Agent for RAG searching."),
+            "name": agent_name,
+            "description": agent_desc,
             "version": "0.1.0",
+            "protocolVersion": "0.3.0",
+            "preferredTransport": "HTTP+JSON",
+            "capabilities": {
+                "streaming": False,
+                "extensions": extensions
+            },
+            "skills": [
+                {
+                    "id": agent_name,
+                    "name": agent_name,
+                    "description": agent_desc
+                }
+            ],
             "tools": []
         }
         tools_list = root_agent.tools if root_agent and hasattr(root_agent, "tools") else []

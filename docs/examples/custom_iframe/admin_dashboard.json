@@ -1,0 +1,15 @@
+{
+  "type": "container",
+  "props": {
+    "className": "w-full max-w-4xl mx-auto p-4 bg-slate-50 dark:bg-slate-900 rounded-xl"
+  },
+  "children": [
+    {
+      "type": "iframe",
+      "props": {
+        "src": "/api/agents/YOUR_ASSIGNED_AGENT_UUID/static/admin.html",
+        "height": "420px"
+      }
+    }
+  ]
+}

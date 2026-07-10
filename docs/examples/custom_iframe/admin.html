@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent Admin Dashboard</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: #f8fafc;
+            color: #0f172a;
+            margin: 0;
+            padding: 20px;
+        }
+        .card {
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            padding: 20px;
+            max-width: 600px;
+            margin: 0 auto;
+        }
+        h2 {
+            margin-top: 0;
+            color: #1e293b;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+            color: #475569;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #cbd5e1;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #3b82f6;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #2563eb;
+        }
+        .status {
+            margin-top: 15px;
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+        .status.success {
+            background-color: #dcfce7;
+            color: #166534;
+            display: block;
+        }
+        .status.error {
+            background-color: #fee2e2;
+            color: #991b1b;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>Agent Custom Control Panel</h2>
+        <p>This admin view utilizes the Dual-Mode fetching pattern to communicate securely with the Hubscape backend in both container-nested and standard layouts.</p>
+        
+        <form id="example-form">
+            <div class="form-group">
+                <label for="inputValue">Configure Value</label>
+                <input type="text" id="inputValue" name="inputValue" placeholder="Enter configuration data..." required>
+            </div>
+            <button type="submit">Save Changes</button>
+        </form>
+
+        <div id="status-message" class="status"></div>
+    </div>
+
+    <script>
+        // Resolve target API endpoint base
+        const API_BASE = window.location.origin;
+
+        // Parse workspace/auth context parameters from URL (Primary mode)
+        const urlParams = new URLSearchParams(window.location.search);
+        const authToken = urlParams.get('authToken');
+        const hubId = urlParams.get('hubId');
+        const orgId = urlParams.get('orgId');
+
+        // Check if we are running in an active shell session
+        const hasUrlContext = !!(authToken || hubId || orgId);
+        console.log(`[Dual-Mode Fetch] URL parameters found: ${hasUrlContext}`);
+
+        // Callback handler when receiving message responses from postMessage (Fallback mode)
+        let messageResolve = null;
+        let messageReject = null;
+
+        window.addEventListener('message', (event) => {
+            const data = event.data;
+            if (!data || typeof data !== 'object') return;
+
+            if (data.type === 'SUBMIT_SUCCESS' && messageResolve) {
+                messageResolve(data.payload);
+                messageResolve = null;
+                messageReject = null;
+            } else if (data.type === 'SUBMIT_ERROR' && messageReject) {
+                messageReject(new Error(data.error || "Form submission failed via postMessage"));
+                messageResolve = null;
+                messageReject = null;
+            }
+        });
+
+        // The unified submit function implementing the Dual-Mode fetching pattern
+        async function submitData(actionUrl, payload) {
+            const statusDiv = document.getElementById('status-message');
+            statusDiv.className = 'status';
+            statusDiv.style.display = 'none';
+
+            // Mode A: Direct REST Fetch (Self-healing, bypassed FormContext)
+            if (hasUrlContext) {
+                console.log("[Dual-Mode Fetch] Executing direct API fetch...");
+                const headers = {
+                    'Content-Type': 'application/json'
+                };
+                if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+                if (hubId) headers['X-Hubscape-Hub-Id'] = hubId;
+                if (orgId) headers['X-Hubscape-Org-Id'] = orgId;
+
+                const response = await fetch(`${API_BASE}${actionUrl}`, {
+                    method: 'POST',
+                    headers: headers,
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    let errMessage = "Submission failed";
+                    try {
+                        const errData = await response.json();
+                        errMessage = errData.detail || errData.message || errMessage;
+                    } catch (e) {}
+                    throw new Error(errMessage);
+                }
+
+                return await response.json();
+            } 
+            
+            // Mode B: postMessage Broker Fallback (Legacy/standard routing)
+            console.log("[Dual-Mode Fetch] Falling back to parent window postMessage...");
+            return new Promise((resolve, reject) => {
+                messageResolve = resolve;
+                messageReject = reject;
+
+                window.parent.postMessage({
+                    type: 'SUBMIT_FORM',
+                    actionUrl: actionUrl,
+                    payload: payload
+                }, '*');
+
+                // Enforce a timeout for safety
+                setTimeout(() => {
+                    if (messageReject) {
+                        messageReject(new Error("Request timed out waiting for parent host response"));
+                        messageResolve = null;
+                        messageReject = null;
+                    }
+                }, 5000);
+            });
+        }
+
+        document.getElementById('example-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const inputVal = document.getElementById('inputValue').value;
+            const statusDiv = document.getElementById('status-message');
+
+            try {
+                // Submit to the agent's custom action endpoint
+                const result = await submitData('/api/plugins/my_agent/example-action', {
+                    input_value: inputVal
+                });
+
+                statusDiv.innerText = result.message || "Saved successfully!";
+                statusDiv.className = 'status success';
+            } catch (err) {
+                statusDiv.innerText = `Error: ${err.message}`;
+                statusDiv.className = 'status error';
+            }
+        });
+    </script>
+</body>
+</html>

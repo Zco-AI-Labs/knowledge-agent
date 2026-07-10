@@ -1,11 +1,11 @@
 import logging
-from typing import List
-import hubscape_adk
+
+from app.core import hubscape_adk
 
 logger = logging.getLogger(__name__)
 
 @hubscape_adk.require_tool_privilege
-def suggest_queries(queries: List[str]) -> dict:
+def suggest_queries(queries: list[str]) -> dict:
     """Shows the user a list of suggested options or choices in the UI when a query is ambiguous.
 
     Args:

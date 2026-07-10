@@ -1,10 +1,12 @@
 [project]
 name = "knowledge-agent"
 version = "0.1.0"
-description = "Knowledge Agent for RAG searching."
+description = ""
 authors = [
     {name = "Your Name", email = "your@email.com"},
 ]
+
+
 
 dependencies = [
     "google-adk[a2a]>=2.0.0,<3.0.0",
@@ -24,6 +26,7 @@ dependencies = [
     "cryptography",
 ]
 requires-python = ">=3.11,<3.14"
+
 
 [dependency-groups]
 dev = [
@@ -58,18 +61,23 @@ select = [
     "UP", # pyupgrade
     "RUF", # ruff specific rules
 ]
-ignore = ["E501", "C901", "B006"]
+ignore = ["E501", "C901", "B006"] # ignore line too long, too complex
 
 [tool.ruff.lint.isort]
 known-first-party = ["app", "frontend"]
 
 [tool.ty]
+# ty is Astral's Rust-based type checker (same team as ruff/uv)
+# See: https://docs.astral.sh/ty/
+
+[tool.ty.environment]
 python-version = "3.10"
 
 [tool.ty.src]
 exclude = [".venv/**"]
 
 [tool.ty.rules]
+# Ignore common issues with third-party libraries and dynamic code patterns
 unresolved-import = "ignore"
 unresolved-attribute = "ignore"
 invalid-argument-type = "ignore"
@@ -83,16 +91,23 @@ deprecated = "ignore"
 ignore-words-list = "rouge"
 skip = "./locust_env/*,uv.lock,.venv,./frontend,**/package-lock.json"
 
+
+
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
 
 [tool.pytest.ini_options]
 pythonpath = "."
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.hatch.build.targets.wheel]
-packages = ["app"]
+packages = ["app","frontend"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"app/privileges.json" = "app/privileges.json"
 
 [tool.uv]
 override-dependencies = ["google-cloud-aiplatform==1.149.0"]

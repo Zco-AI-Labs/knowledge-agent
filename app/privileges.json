@@ -1,0 +1,12 @@
+{
+  "privileges": {
+    "1": {
+      "name": "Knowledge Researcher",
+      "description": "Allows search access to the shared RAG corpus and UI query suggestion capabilities",
+      "tools": [
+        "search_knowledge",
+        "suggest_queries"
+      ]
+    }
+  }
+}

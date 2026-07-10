@@ -1,0 +1,56 @@
+{
+  "type": "container",
+  "props": {
+    "direction": "vertical",
+    "gap": "sm",
+    "padding": "md"
+  },
+  "children": [
+    {
+      "type": "text",
+      "props": {
+        "text": "Contact Support Form",
+        "size": "lg",
+        "weight": "bold"
+      }
+    },
+    {
+      "type": "input",
+      "props": {
+        "name": "name",
+        "label": "Your Name",
+        "placeholder": "Enter your name",
+        "required": true
+      }
+    },
+    {
+      "type": "input",
+      "props": {
+        "name": "email",
+        "label": "Email Address",
+        "placeholder": "Enter your email address",
+        "required": true
+      }
+    },
+    {
+      "type": "input",
+      "props": {
+        "name": "description",
+        "label": "Description of Help Needed",
+        "placeholder": "How can we help you?",
+        "required": true,
+        "multiline": true
+      }
+    },
+    {
+      "type": "button",
+      "props": {
+        "label": "Submit Contact Request",
+        "actionUrl": "agent://save_contact",
+        "styling": {
+          "colorTheme": "blue"
+        }
+      }
+    }
+  ]
+}
