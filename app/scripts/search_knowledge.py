@@ -96,8 +96,8 @@ async def search_knowledge(query: str) -> dict:
                 )
             )
 
-        # Set search limit natively
-        candidate_limit = 20
+        # Set search limit natively (using 40 as a safety buffer for legacy corpus post-filtering)
+        candidate_limit = 40
         query_obj = aiplatform_v1beta1.types.RagQuery(
             text=query,
             similarity_top_k=candidate_limit,
