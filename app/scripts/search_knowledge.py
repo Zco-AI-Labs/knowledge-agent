@@ -77,12 +77,31 @@ async def search_knowledge(query: str) -> dict:
             credentials=credentials
         )
 
-        # Serverless RAG does not support query-time metadata filtering.
-        # We query globally with an increased candidate limit and filter post-retrieval.
+        cel_parts = []
+        if hub_id:
+            cel_parts.append(f'metadata.hubId == "{hub_id}"')
+        if org_id:
+            cel_parts.append(f'metadata.orgId == "{org_id}"')
+        # Always allow global platform-host files
+        cel_parts.append('metadata.hubId == "platform_host"')
+        
+        cel_filter = " || ".join(cel_parts)
+        logger.info(f"[knowledge_agent] Constructed CEL filter: {cel_filter}")
+
+        rag_retrieval_config = None
+        if cel_filter:
+            rag_retrieval_config = aiplatform_v1beta1.types.RagRetrievalConfig(
+                filter=aiplatform_v1beta1.types.RagRetrievalConfig.Filter(
+                    metadata_filter=cel_filter
+                )
+            )
+
+        # Set search limit natively
         candidate_limit = 20
         query_obj = aiplatform_v1beta1.types.RagQuery(
             text=query,
-            similarity_top_k=candidate_limit
+            similarity_top_k=candidate_limit,
+            rag_retrieval_config=rag_retrieval_config
         )
 
         rag_resource = aiplatform_v1beta1.types.RetrieveContextsRequest.VertexRagStore.RagResource(
@@ -99,7 +118,7 @@ async def search_knowledge(query: str) -> dict:
             query=query_obj
         )
 
-        logger.info(f"[knowledge_agent] querying RAG parent_location: {parent_location}, corpus_id: {corpus_id}, query_obj top_k: {candidate_limit}")
+        logger.info(f"[knowledge_agent] querying RAG parent_location: {parent_location}, corpus_id: {corpus_id}, query_obj top_k: {candidate_limit} with CEL filter: '{cel_filter}'")
         response = await asyncio.to_thread(
             client.retrieve_contexts,
             request=request
