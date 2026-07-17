@@ -119,10 +119,25 @@ async def search_knowledge(query: str) -> dict:
         )
 
         logger.info(f"[knowledge_agent] querying RAG parent_location: {parent_location}, corpus_id: {corpus_id}, query_obj top_k: {candidate_limit} with CEL filter: '{cel_filter}'")
-        response = await asyncio.to_thread(
-            client.retrieve_contexts,
-            request=request
-        )
+        
+        try:
+            from opentelemetry import trace
+            tracer = trace.get_tracer(__name__)
+            span_ctx = tracer.start_as_current_span("vertex_rag_retrieval")
+        except Exception:
+            from contextlib import nullcontext
+            span_ctx = nullcontext()
+            
+        with span_ctx as span:
+            if span and hasattr(span, "set_attribute"):
+                span.set_attribute("rag.corpus_id", corpus_id)
+                span.set_attribute("rag.query_length", len(query))
+                span.set_attribute("queryCount", 1)
+                
+            response = await asyncio.to_thread(
+                client.retrieve_contexts,
+                request=request
+            )
 
         contexts_list = getattr(response, "contexts", None)
         contexts = getattr(contexts_list, "contexts", []) if contexts_list else []

@@ -68,6 +68,12 @@ from google.cloud import logging as google_cloud_logging
 from vertexai.preview.reasoning_engines import A2aAgent
 
 from app.core import hubscape_adk
+from contextvars import ContextVar
+telemetry_org_id = ContextVar("telemetry_org_id", default=None)
+telemetry_hub_id = ContextVar("telemetry_hub_id", default=None)
+telemetry_user_id = ContextVar("telemetry_user_id", default=None)
+telemetry_conversation_id = ContextVar("telemetry_conversation_id", default=None)
+
 from app.agent import app as adk_app
 from app.app_utils.telemetry import setup_telemetry
 from app.app_utils.typing import Feedback
@@ -194,6 +200,95 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
             
         root_agent.instruction = f"{session_context}{roster_str}\n{base_instruction}"
         
+        # --- OPENTELEMETRY CONTEXT ENRICHMENT ---
+        session_id_resolved = metadata.get("sessionId") or metadata.get("session_id") or f"session_{user_id_resolved}_{hub_id}"
+        
+        # --- TELEMETRY CONTEXT VARIABLES SETTING ---
+        telemetry_org_id.set(org_id or "unknown")
+        telemetry_hub_id.set(hub_id or "unknown")
+        telemetry_user_id.set(user_id_resolved or "unknown")
+
+        try:
+            from opentelemetry import trace
+            current_span = trace.get_current_span()
+            if current_span:
+                current_span.set_attribute("org_id", org_id or "unknown")
+                current_span.set_attribute("hub_id", hub_id or "unknown")
+                current_span.set_attribute("user_id", user_id_resolved or "unknown")
+        except Exception as otel_err:
+            print(f"⚠️ Failed to set OpenTelemetry span attributes in executor: {otel_err}")
+
+        # --- DYNAMIC OTEL LOG PROCESSOR REGISTRATION ---
+        try:
+            from opentelemetry._logs import get_logger_provider
+            from opentelemetry.sdk._logs import LoggerProvider
+
+            provider = get_logger_provider()
+            if hasattr(provider, "_logger_provider"):
+                provider = provider._logger_provider
+
+            if isinstance(provider, LoggerProvider):
+                has_processor = any(
+                    p.__class__.__name__ == "BillingContextLogRecordProcessor"
+                    for p in getattr(provider, "_log_record_processors", [])
+                )
+                if not has_processor:
+                    from opentelemetry.sdk._logs import LogRecordProcessor
+
+                    class BillingContextLogRecordProcessor(LogRecordProcessor):
+                        def on_emit(self, log_record, context=None):
+                            try:
+                                # 1. Try tracing span attributes
+                                span = trace.get_current_span()
+                                if span and span.get_span_context().is_valid:
+                                    span_attribs = getattr(span, "attributes", None)
+                                    if span_attribs:
+                                        for key in ["org_id", "hub_id", "user_id"]:
+                                            if key in span_attribs:
+                                                val = span_attribs[key]
+                                                log_record_inner = getattr(log_record, "log_record", None)
+                                                if log_record_inner:
+                                                    if not log_record_inner.attributes:
+                                                        log_record_inner.attributes = {}
+                                                    log_record_inner.attributes[key] = val
+                                                else:
+                                                    if not log_record.attributes:
+                                                        log_record.attributes = {}
+                                                    log_record.attributes[key] = val
+
+                                # 2. Fallback/overwrite with task-local ContextVars (extremely reliable)
+                                ctx_vars = {
+                                    "org_id": telemetry_org_id.get(),
+                                    "hub_id": telemetry_hub_id.get(),
+                                    "user_id": telemetry_user_id.get()
+                                }
+                                for key, val in ctx_vars.items():
+                                    if val is not None:
+                                        log_record_inner = getattr(log_record, "log_record", None)
+                                        if log_record_inner:
+                                            if not log_record_inner.attributes:
+                                                log_record_inner.attributes = {}
+                                            log_record_inner.attributes[key] = val
+                                        else:
+                                            if not log_record.attributes:
+                                                log_record.attributes = {}
+                                            log_record.attributes[key] = val
+                            except Exception:
+                                pass
+
+                        def force_flush(self, timeout_millis: int = 30000) -> bool:
+                            return True
+
+                        def shutdown(self) -> None:
+                            pass
+
+                    provider.add_log_record_processor(BillingContextLogRecordProcessor())
+                    import logging
+                    logging.info("BillingContextLogRecordProcessor dynamically registered successfully on LoggerProvider")
+        except Exception as otel_reg_err:
+            import logging
+            logging.warning("Failed to dynamically register BillingContextLogRecordProcessor: %s", otel_reg_err)
+
         try:
             # Enter the context session to ensure all Firestore calls in tools are authenticated
             with hubscape_adk.context_session(remote_ctx):
@@ -400,6 +495,45 @@ class AgentEngineApp(A2aAgent):
         vertexai.init()
         setup_telemetry()
         super().set_up()
+        
+        # Register billing context processor to propagate span attributes to log records
+        try:
+            from opentelemetry.sdk._logs import LogRecordProcessor
+            from opentelemetry import trace
+
+            class BillingContextLogRecordProcessor(LogRecordProcessor):
+                def emit(self, log_record, context=None):
+                    try:
+                        span = trace.get_current_span()
+                        if span and span.get_span_context().is_valid:
+                            span_attribs = getattr(span, "attributes", None)
+                            if span_attribs:
+                                for key in ["org_id", "hub_id", "user_id", "gen_ai.conversation_id"]:
+                                    if key in span_attribs:
+                                        val = span_attribs[key]
+                                        log_record_inner = getattr(log_record, "log_record", None)
+                                        if log_record_inner:
+                                            if not log_record_inner.attributes:
+                                                log_record_inner.attributes = {}
+                                            log_record_inner.attributes[key] = val
+                                        else:
+                                            if not log_record.attributes:
+                                                log_record.attributes = {}
+                                            log_record.attributes[key] = val
+                    except Exception:
+                        pass
+
+            from opentelemetry._logs import get_logger_provider
+            from opentelemetry.sdk._logs import LoggerProvider
+            provider = get_logger_provider()
+            if isinstance(provider, LoggerProvider):
+                provider.add_log_record_processor(BillingContextLogRecordProcessor())
+                logging.info("BillingContextLogRecordProcessor registered successfully on LoggerProvider")
+            else:
+                logging.warning("LoggerProvider is not a LoggerProvider: %s", type(provider))
+        except Exception as otel_reg_err:
+            logging.warning("Failed to register BillingContextLogRecordProcessor: %s", otel_reg_err)
+
         logging.basicConfig(level=logging.INFO)
         logging_client = google_cloud_logging.Client()
         self.logger = logging_client.logger(__name__)
