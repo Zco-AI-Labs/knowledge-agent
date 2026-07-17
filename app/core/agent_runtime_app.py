@@ -181,12 +181,9 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
         
         base_instruction = root_agent.instruction or ""
         
-        # Inject Active Session Context securely at the top of the prompt
+        # Inject Active Session Context securely at the top of the prompt (excluding sensitive database UUIDs to prevent logging leaks)
         session_context = f"""
 [ACTIVE SESSION CONTEXT]
-- User ID: {user_id_resolved}
-- Hub ID: {hub_id or 'none'}
-- Organization ID: {org_id or 'none'}
 - Interaction Mode: {mode}
 """
         
