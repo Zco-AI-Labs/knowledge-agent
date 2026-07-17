@@ -143,6 +143,56 @@ async def search_knowledge(query: str) -> dict:
         contexts = getattr(contexts_list, "contexts", []) if contexts_list else []
         logger.info(f"[knowledge_agent] retrieve_contexts returned {len(contexts)} contexts")
 
+        # Log RAG search query usage transaction to GCP BigQuery (via Cloud Logging)
+        try:
+            from datetime import datetime
+            from google.cloud import firestore
+            from google.cloud import logging as gcp_logging
+            
+            user_id = context.auth.get_user_id()
+            
+            event_payload = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "successful": True,
+                "hubId": hub_id,
+                "orgId": org_id,
+                "userId": user_id,
+                "agentId": "knowledge_agent",
+                "type": "vertex_rag_retrieval",
+                "provider": "Vertex AI / RAG",
+                "modelId": "Vertex RAG Search",
+                "metadata": {
+                    "queryCount": 1,
+                    "queryLength": len(query),
+                    "corpusId": corpus_id,
+                    "systemCredits": 50,  # 50 credits flat fee for RAG search
+                    "estimatedCostUsd": 0.005
+                }
+            }
+            # Remove None values
+            event_payload = {k: v for k, v in event_payload.items() if v is not None}
+            
+            # Stream payload directly to Cloud Logging (which routes to BigQuery)
+            try:
+                gcp_client = gcp_logging.Client()
+                logger_gcp = gcp_client.logger("hubscape.platform.transactions")
+                logger_gcp.log_struct(event_payload, severity="INFO")
+                logger.info("[knowledge_agent] Streamed RAG telemetry payload directly to GCP Cloud Logging.")
+            except Exception as bq_log_err:
+                logger.warning(f"[knowledge_agent] Failed to stream RAG transaction to Cloud Logging: {bq_log_err}")
+
+            # Keep real-time Firestore credit debit (updates customer wallet balance)
+            if org_id:
+                billing_ref = db_client.collection("organizations").document(org_id).collection("billing").document("status")
+                billing_ref.update({
+                    "creditsAvailable": firestore.Increment(-50),
+                    "creditsUsed": firestore.Increment(50),
+                    "lastUpdated": firestore.SERVER_TIMESTAMP
+                })
+                logger.info(f"[knowledge_agent] Debited 50 credits from org {org_id} for RAG search.")
+        except Exception as log_err:
+            logger.warning(f"[knowledge_agent] General RAG billing telemetry failure: {log_err}")
+
         # 1. Collect file IDs from contexts
         file_ids = []
         for i, context_item in enumerate(contexts):
