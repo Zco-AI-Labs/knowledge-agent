@@ -12,5 +12,5 @@ create_params:
   session_type: "in_memory"
   cicd_runner: "skip"
   include_data_ingestion: true
-  datastore: "vertex_rag_corpus"
+  datastore: "projects/hubscape-geap/locations/us-central1/ragCorpora/8331289874728484864"
   agent_guidance_filename: "GEMINI.md"
