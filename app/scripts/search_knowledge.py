@@ -77,26 +77,10 @@ async def search_knowledge(query: str) -> dict:
             credentials=credentials
         )
 
-        cel_parts = []
-        if hub_id:
-            cel_parts.append(f'metadata.hubId == "{hub_id}"')
-        if org_id:
-            cel_parts.append(f'metadata.orgId == "{org_id}"')
-        # Always allow global platform-host files
-        cel_parts.append('metadata.hubId == "platform_host"')
-        
-        cel_filter = " || ".join(cel_parts)
-        logger.info(f"[knowledge_agent] Constructed CEL filter: {cel_filter}")
-
+        # Rely on post-retrieval Firestore tenant validation (matching tools/search.py)
+        # to ensure zero candidate starvation without requiring per-file GCP metadata API calls.
         rag_retrieval_config = None
-        if cel_filter:
-            rag_retrieval_config = aiplatform_v1beta1.types.RagRetrievalConfig(
-                filter=aiplatform_v1beta1.types.RagRetrievalConfig.Filter(
-                    metadata_filter=cel_filter
-                )
-            )
 
-        # Set search limit natively (using 40 as a safety buffer for legacy corpus post-filtering)
         candidate_limit = 40
         query_obj = aiplatform_v1beta1.types.RagQuery(
             text=query,
@@ -118,7 +102,7 @@ async def search_knowledge(query: str) -> dict:
             query=query_obj
         )
 
-        logger.info(f"[knowledge_agent] querying RAG parent_location: {parent_location}, corpus_id: {corpus_id}, query_obj top_k: {candidate_limit} with CEL filter: '{cel_filter}'")
+        logger.info(f"[knowledge_agent] querying RAG parent_location: {parent_location}, corpus_id: {corpus_id}, query_obj top_k: {candidate_limit}")
         
         try:
             from opentelemetry import trace
@@ -207,10 +191,11 @@ async def search_knowledge(query: str) -> dict:
         registry_map = {}
         if file_ids:
             corpus_id_num = corpus_id.split('/')[-1]
-            full_ids = [
-                f"projects/{project_id}/locations/{location}/ragCorpora/{corpus_id_num}/ragFiles/{fid}"
-                for fid in set(file_ids)
-            ]
+            project_number = os.environ.get('PROJECT_NUMBER') or os.environ.get('GCP_PROJECT_NUMBER') or "1097730318341"
+            full_ids = []
+            for fid in set(file_ids):
+                full_ids.append(f"projects/{project_id}/locations/{location}/ragCorpora/{corpus_id_num}/ragFiles/{fid}")
+                full_ids.append(f"projects/{project_number}/locations/{location}/ragCorpora/{corpus_id_num}/ragFiles/{fid}")
             logger.info(f"[knowledge_agent] Firestore batch lookup full_ids: {full_ids}")
 
             chunked_ids = [full_ids[i:i + 30] for i in range(0, len(full_ids), 30)]
