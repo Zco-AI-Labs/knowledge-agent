@@ -225,7 +225,7 @@ async def search_knowledge(query: str) -> dict:
                     filename = s_uri.split('/')[-1]
                     d_id = filename.split('_')[0]
                     if d_id:
-                        dsnap = db.collection('rag_knowledge').document(d_id).get()
+                        dsnap = await asyncio.to_thread(db_client.collection('rag_knowledge').document(d_id).get)
                         if dsnap.exists:
                             doc_meta = dsnap.to_dict() or {}
 
