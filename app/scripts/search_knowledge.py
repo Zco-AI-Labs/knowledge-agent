@@ -219,6 +219,15 @@ async def search_knowledge(query: str) -> dict:
                 fid = getattr(context_item.chunk, 'file_id', '')
 
             doc_meta = registry_map.get(fid, {})
+            if not doc_meta and hasattr(context_item, 'source_uri') and context_item.source_uri:
+                s_uri = context_item.source_uri or ""
+                if "rag_batch_imports" in s_uri:
+                    filename = s_uri.split('/')[-1]
+                    d_id = filename.split('_')[0]
+                    if d_id:
+                        dsnap = db.collection('rag_knowledge').document(d_id).get()
+                        if dsnap.exists:
+                            doc_meta = dsnap.to_dict() or {}
 
             # Tenant isolation check:
             # A document is allowed if it is platform-wide (platform_host) or matches target tenant scope
