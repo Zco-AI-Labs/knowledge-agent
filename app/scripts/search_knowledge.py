@@ -81,7 +81,7 @@ async def search_knowledge(query: str) -> dict:
         # to ensure zero candidate starvation without requiring per-file GCP metadata API calls.
         rag_retrieval_config = None
 
-        candidate_limit = 200
+        candidate_limit = 100
         query_obj = aiplatform_v1beta1.types.RagQuery(
             text=query,
             similarity_top_k=candidate_limit,
