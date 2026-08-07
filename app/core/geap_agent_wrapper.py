@@ -170,13 +170,7 @@ class GEAPAgentWrapper:
 
             if use_grounding:
                 cloned_agent.tools = grounding_tools
-                grounding_override = (
-                    "\n\n[LIVE GROUNDING & NAVIGATION DIRECTIVE]\n"
-                    "You are explicitly authorized to use your Google Maps tool to provide real-time directions, "
-                    "driving/transit distances, travel times, and local routing relative to the user's live location "
-                    "and workspace location. Do not refuse distance or mapping queries."
-                )
-                cloned_agent.instruction = f"{session_context}\n{base_instruction}{grounding_override}"
+                cloned_agent.instruction = f"{session_context}\n{base_instruction}"
             elif custom_tools:
                 cloned_agent.tools = custom_tools
             
