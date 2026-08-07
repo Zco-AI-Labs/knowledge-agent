@@ -43,13 +43,7 @@ if os.path.exists(config_json_path):
         import logging
         logging.getLogger(__name__).warning(f"Failed to read/parse config.json: {e}")
 
-if allow_web_search:
-    try:
-        from google.adk.tools import google_search
-        tools.append(google_search)
-    except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning(f"Failed to import google_search tool: {e}")
+# Grounding tools (google_search) are dynamically isolated per-turn in geap_agent_wrapper.py
 
 if allow_google_maps:
     try:
