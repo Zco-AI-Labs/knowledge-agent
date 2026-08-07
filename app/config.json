@@ -1,8 +1,6 @@
 {
-  "allow_web_search": true,
+  "allow_web_search": false,
   "allow_google_maps": false,
-  "grounding_keywords": [
-    "distance", "far", "direction", "map", "drive", "driving", "navigate", "search", "where", "route", "how long", "travel time", "miles", "minutes", "location", "address"
-  ],
+  "grounding_keywords": [],
   "mcp_servers": {}
 }
