@@ -73,6 +73,7 @@ telemetry_org_id = ContextVar("telemetry_org_id", default=None)
 telemetry_hub_id = ContextVar("telemetry_hub_id", default=None)
 telemetry_user_id = ContextVar("telemetry_user_id", default=None)
 telemetry_conversation_id = ContextVar("telemetry_conversation_id", default=None)
+request_runner_ctx = ContextVar("request_runner_ctx", default=None)
 
 from app.agent import app as adk_app
 from app.app_utils.telemetry import setup_telemetry
@@ -146,6 +147,12 @@ class ActionInterceptingEventQueue(EventQueue):
 
 class AgentEngineA2aExecutor(A2aAgentExecutor):
     """Custom A2A Executor that intercepts requests to inject RemoteContext."""
+    async def _resolve_runner(self) -> Runner:
+        scoped = request_runner_ctx.get()
+        if scoped is not None:
+            return scoped
+        return await super()._resolve_runner()
+
     async def execute(
         self,
         context: RequestContext,
@@ -163,6 +170,13 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
         hub_id = metadata.get("hubId") or metadata.get("hub_id")
         mode = metadata.get("mode") or "none"
         
+        session_id_resolved = metadata.get("sessionId") or metadata.get("session_id") or f"session_{user_id_resolved}_{hub_id}"
+        
+        # Align A2A context ID with the resolved session ID to unify session management
+        context._context_id = session_id_resolved
+        if hasattr(context, "_params") and context._params and hasattr(context._params, "message") and context._params.message:
+            context._params.message.context_id = session_id_resolved
+            
         agent_name = root_agent.name.replace('_', '-') if root_agent and hasattr(root_agent, "name") else "custom-agent"
         agent_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/Zco-AI-Labs/{agent_name}"))
         from app.app_utils.env_resolver import get_project_id
@@ -179,13 +193,40 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
         
         interceptor = ActionInterceptingEventQueue(event_queue, remote_ctx)
         
-        base_instruction = root_agent.instruction or ""
+        # Resolve the runner and clone the agent to ensure request-scoped concurrency safety
+        base_runner = await super()._resolve_runner()
+        
+        workspace_type = metadata.get("workspaceType")
+        workspace_id = metadata.get("workspaceId")
+        if not workspace_type or not workspace_id:
+            is_org_scope = (hub_id == org_id) or (not hub_id) or (hub_id == "platform")
+            workspace_type = "organization" if is_org_scope else "hub"
+            workspace_id = org_id if is_org_scope else hub_id
+
+        # Concurrency-safe dynamic tool filtering based on workspace scope and user privileges
+        from app.core.hubscape_adk import filter_tools_for_scope, resolve_mcp_tools
+        cloned_agent = filter_tools_for_scope(
+            agent=base_runner.agent,
+            user_privileges=remote_ctx.user_privileges,
+            workspace_type=workspace_type,
+            workspace_id=workspace_id,
+            org_id=org_id
+        )
+        
+        # Resolve remote MCP headers and access control whitelists asynchronously
+        cloned_agent = await resolve_mcp_tools(cloned_agent, remote_ctx)
+        
+        base_instruction = base_runner.agent.instruction or ""
         
         # Inject Active Session Context securely at the top of the prompt (excluding sensitive database UUIDs to prevent logging leaks)
-        session_context = f"""
-[ACTIVE SESSION CONTEXT]
-- Interaction Mode: {mode}
-"""
+        normalized_mode = "chat_pc" if mode in ("chat_pc", "chat_phone") else mode
+        session_context = (
+            "[ACTIVE WORKSPACE CONTEXT]\n"
+            f"- Interaction Mode: {normalized_mode}\n"
+            f"- Workspace Type: {workspace_type}\n"
+            f"- Workspace ID: {workspace_id or 'none'}\n"
+            f"- Organization ID: {org_id or 'none'}\n"
+        )
         
         # Format and append accessible agents roster
         accessible_agents = metadata.get("accessible_agents", [])
@@ -195,7 +236,20 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
                 f"- {a.get('name')} (ID: {a.get('id')}): {a.get('description')}" for a in accessible_agents
             ) + "\n"
             
-        root_agent.instruction = f"{session_context}{roster_str}\n{base_instruction}"
+        cloned_agent.instruction = f"{session_context}{roster_str}\n{base_instruction}"
+        
+        # Instantiate a request-scoped runner to avoid polluting the process-wide singleton
+        scoped_runner = Runner(
+            agent=cloned_agent,
+            app_name=base_runner.app_name,
+            session_service=base_runner.session_service,
+            artifact_service=getattr(base_runner, "artifact_service", None),
+            memory_service=getattr(base_runner, "memory_service", None),
+            credential_service=getattr(base_runner, "credential_service", None),
+            auto_create_session=getattr(base_runner, "auto_create_session", False),
+        )
+        
+        token = request_runner_ctx.set(scoped_runner)
         
         # --- OPENTELEMETRY CONTEXT ENRICHMENT ---
         session_id_resolved = metadata.get("sessionId") or metadata.get("session_id") or f"session_{user_id_resolved}_{hub_id}"
@@ -212,6 +266,12 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
                 current_span.set_attribute("org_id", org_id or "unknown")
                 current_span.set_attribute("hub_id", hub_id or "unknown")
                 current_span.set_attribute("user_id", user_id_resolved or "unknown")
+                current_span.set_attribute("gen_ai.conversation_id", session_id_resolved)
+                
+                # Determine query type (direct vs nested A2A) using call depth
+                depth = metadata.get("depth", 0)
+                request_type = "a2a" if depth > 0 else "direct"
+                current_span.set_attribute("gen_ai.request.type", request_type)
         except Exception as otel_err:
             print(f"⚠️ Failed to set OpenTelemetry span attributes in executor: {otel_err}")
 
@@ -233,6 +293,9 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
                     from opentelemetry.sdk._logs import LogRecordProcessor
 
                     class BillingContextLogRecordProcessor(LogRecordProcessor):
+                        def emit(self, log_record, context=None):
+                            self.on_emit(log_record, context)
+
                         def on_emit(self, log_record, context=None):
                             try:
                                 # 1. Try tracing span attributes
@@ -240,7 +303,7 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
                                 if span and span.get_span_context().is_valid:
                                     span_attribs = getattr(span, "attributes", None)
                                     if span_attribs:
-                                        for key in ["org_id", "hub_id", "user_id"]:
+                                        for key in ["org_id", "hub_id", "user_id", "gen_ai.request.model", "gen_ai_request_model", "provider", "latency_ms"]:
                                             if key in span_attribs:
                                                 val = span_attribs[key]
                                                 log_record_inner = getattr(log_record, "log_record", None)
@@ -286,12 +349,86 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
             import logging
             logging.warning("Failed to dynamically register BillingContextLogRecordProcessor: %s", otel_reg_err)
 
+        # Determine the user ID the runner will use internally
+        runner_user_id = user_id_resolved
+        if hasattr(context, "call_context") and context.call_context and hasattr(context.call_context, "user") and context.call_context.user and getattr(context.call_context.user, "user_name", None):
+            runner_user_id = context.call_context.user.user_name
+
         try:
             # Enter the context session to ensure all Firestore calls in tools are authenticated
             with hubscape_adk.context_session(remote_ctx):
+                # 1. Restore ADK session trajectory from Firestore if available
+                try:
+                    session_doc = remote_ctx.get(scope="user", collection_name="sessions", doc_id=session_id_resolved)
+                    if session_doc and "adk_session" in session_doc:
+                        adk_session_json = session_doc["adk_session"]
+                        from google.adk.sessions import Session
+                        session_obj = Session.model_validate_json(adk_session_json)
+                        
+                        runner = scoped_runner
+                        app_name = runner.app_name
+                        sid = session_obj.id
+                        
+                        # Ensure fields match current context
+                        session_obj.app_name = app_name
+                        session_obj.user_id = user_id_resolved
+                        
+                        if app_name not in runner.session_service.sessions:
+                            runner.session_service.sessions[app_name] = {}
+                        for u_key in set([user_id_resolved, runner_user_id, f"A2A_USER_{session_id_resolved}"]):
+                            if u_key not in runner.session_service.sessions[app_name]:
+                                runner.session_service.sessions[app_name][u_key] = {}
+                            runner.session_service.sessions[app_name][u_key][sid] = session_obj
+                except Exception as restore_err:
+                    import logging
+                    logging.warning("⚠️ Non-critical: Failed to restore session trajectory: %s", restore_err)
+
+                # Ensure active session object is created/fetched and linked to remote_ctx before tools run
+                try:
+                    runner = scoped_runner
+                    session_obj = await runner.session_service.get_session(
+                        app_name=runner.app_name,
+                        user_id=runner_user_id,
+                        session_id=session_id_resolved
+                    )
+                    if not session_obj:
+                        session_obj = await runner.session_service.create_session(
+                            app_name=runner.app_name,
+                            user_id=runner_user_id,
+                            session_id=session_id_resolved
+                        )
+                    session_obj.user_id = user_id_resolved
+                    remote_ctx.session = session_obj
+                except Exception as session_init_err:
+                    import logging
+                    logging.warning("⚠️ Non-critical: Failed to bind session to context: %s", session_init_err)
+
                 await super().execute(context, interceptor)
+
+                # 2. Persist updated ADK session state back to Firestore
+                try:
+                    runner = scoped_runner
+                    updated_session = await runner.session_service.get_session(
+                        app_name=runner.app_name,
+                        user_id=runner_user_id,
+                        session_id=session_id_resolved
+                    )
+                    if updated_session:
+                        updated_session.user_id = user_id_resolved
+                        serialized_json = updated_session.model_dump_json()
+                        remote_ctx.save(
+                            scope="user",
+                            collection_name="sessions",
+                            doc_id=session_id_resolved,
+                            data={
+                                "adk_session": serialized_json
+                            }
+                        )
+                except Exception as save_err:
+                    import logging
+                    logging.warning("⚠️ Non-critical: Failed to save session trajectory: %s", save_err)
         finally:
-            root_agent.instruction = base_instruction
+            request_runner_ctx.reset(token)
 
         # Determine if there are actions to propagate
         has_actions = bool(remote_ctx.actions)
@@ -319,7 +456,8 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
                         "directive": "execute_host_tool",
                         "target_tool": "openAdminWidget",
                         "parameters": {
-                            "widgetType": payload.get("widgetType")
+                            "widgetType": payload.get("widgetType"),
+                            "confirmation_obtained": payload.get("confirmation_obtained", True)
                         },
                         "message": interceptor.accumulated_text or "Opening admin widget."
                     }
@@ -352,6 +490,17 @@ class AgentEngineA2aExecutor(A2aAgentExecutor):
                             "url": payload.get("url")
                         },
                         "message": interceptor.accumulated_text or "Opening link."
+                    }
+                    break
+                elif atype == "REFRESH_TOKEN":
+                    directive_payload = {
+                        "directive": "execute_host_tool",
+                        "target_tool": "refreshToken",
+                        "parameters": {
+                            "provider": payload.get("provider"),
+                            "agent_id": payload.get("agent_id")
+                        },
+                        "message": "Refreshing authentication token..."
                     }
                     break
                 elif atype == "END_CALL":
@@ -505,7 +654,7 @@ class AgentEngineApp(A2aAgent):
                         if span and span.get_span_context().is_valid:
                             span_attribs = getattr(span, "attributes", None)
                             if span_attribs:
-                                for key in ["org_id", "hub_id", "user_id", "gen_ai.conversation_id"]:
+                                for key in ["org_id", "hub_id", "user_id", "gen_ai.conversation_id", "gen_ai.request.model", "gen_ai_request_model", "provider", "latency_ms"]:
                                     if key in span_attribs:
                                         val = span_attribs[key]
                                         log_record_inner = getattr(log_record, "log_record", None)

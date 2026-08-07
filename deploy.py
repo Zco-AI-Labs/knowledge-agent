@@ -94,9 +94,107 @@ def sync_agent_name(new_name):
             except Exception as e:
                 print(f"Warning: Failed to update {relative_path}. Error: {e}")
 
+# Helper to sync config.json to agents-cli-manifest.yaml
+def sync_config_to_manifest():
+    import json
+    import yaml
+    
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(project_dir, "config.json")
+    manifest_path = os.path.join(project_dir, "agents-cli-manifest.yaml")
+    
+    default_create_params = {
+        "deployment_target": "agent_runtime",
+        "is_a2a": True,
+        "session_type": "in_memory",
+        "cicd_runner": "skip",
+        "include_data_ingestion": False,
+        "datastore": "none",
+        "agent_guidance_filename": "GEMINI.md"
+    }
+
+    # 1. If config.json does not exist, extract from manifest or use defaults
+    if not os.path.exists(config_path):
+        print("config.json not found. Extracting create_params from manifest...")
+        create_params = default_create_params.copy()
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    manifest_data = yaml.safe_load(f) or {}
+                if "create_params" in manifest_data and isinstance(manifest_data["create_params"], dict):
+                    create_params = manifest_data["create_params"]
+            except Exception as e:
+                print(f"Warning: Failed to load manifest to create default config.json. Error: {e}")
+        
+        config_data = {
+            "agents-cli-manifest": {
+                "create_params": create_params
+            }
+        }
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config_data, f, indent=2)
+            print("  Created default config.json successfully.")
+        except Exception as e:
+            print(f"Warning: Failed to write config.json. Error: {e}")
+            return
+
+    # 2. config.json exists (or was just created). Load and merge into manifest
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_data = json.load(f) or {}
+    except Exception as e:
+        print(f"Error: Failed to parse config.json. Error: {e}")
+        return
+
+    nested_manifest = config_data.get("agents-cli-manifest", {})
+    if not isinstance(nested_manifest, dict):
+        print("Warning: 'agents-cli-manifest' in config.json is not a dictionary.")
+        nested_manifest = {}
+    config_create_params = nested_manifest.get("create_params", {})
+    if not isinstance(config_create_params, dict):
+        print("Warning: 'create_params' in config.json is not a dictionary.")
+        config_create_params = {}
+
+    if not os.path.exists(manifest_path):
+        print(f"Warning: Manifest file {manifest_path} does not exist. Cannot merge configuration.")
+        return
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest_data = yaml.safe_load(f) or {}
+        
+        if "create_params" not in manifest_data or not isinstance(manifest_data["create_params"], dict):
+            manifest_data["create_params"] = {}
+        
+        for k, v in config_create_params.items():
+            manifest_data["create_params"][k] = v
+            
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(manifest_data, f, default_flow_style=False, sort_keys=False)
+            
+        print("Successfully merged create_params from config.json into agents-cli-manifest.yaml.")
+    except Exception as e:
+        print(f"Error: Failed to update agents-cli-manifest.yaml. Error: {e}")
+
+# Sync developer-defined config from config.json to manifest first
+sync_config_to_manifest()
+
 # Resolve the name and run synchronization before deploying
 display_name = get_new_agent_name()
 sync_agent_name(display_name)
+
+# Run 'uv lock' to properly regenerate and synchronize uv.lock
+uv_path = shutil.which("uv")
+if uv_path:
+    print("Running 'uv lock' to synchronize and validate uv.lock...")
+    try:
+        subprocess.run([uv_path, "lock"], check=True)
+        print("  uv.lock successfully updated and synchronized.")
+    except Exception as e:
+        print(f"Warning: 'uv lock' failed: {e}")
+else:
+    print("Warning: 'uv' command not found. Please ensure uv is installed and run 'uv lock' to validate dependency locks.")
 
 print(f"Deploying {display_name} via native agents-cli...")
 
@@ -136,7 +234,6 @@ cmd = [
     "--region", LOCATION,
     "--service-name", display_name,
     "--service-account", f"{iam_profile}@{PROJECT_ID}.iam.gserviceaccount.com",
-    "--update-env-vars", "LOGS_BUCKET_NAME=hubscape-geap-telemetry-logs,OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=NO_CONTENT,OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental",
     "--no-confirm-project"
 ]
 

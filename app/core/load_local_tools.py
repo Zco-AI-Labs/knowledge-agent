@@ -21,6 +21,7 @@ def load_local_tools(scripts_dir: str) -> list:
                     func = getattr(module, module_name, None)
                     if func and callable(func):
                         tools.append(func)
-            except Exception:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Failed to load tool {module_name} from {file_path}: {e}", exc_info=True)
     return tools

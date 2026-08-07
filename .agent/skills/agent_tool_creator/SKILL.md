@@ -78,6 +78,10 @@ Tools should check the active interface mode to format observations appropriatel
 * **Voice Mode:** Return concise, natural text responses optimized for text-to-speech, and avoid queuing complex UI cards. Use the `END_CALL` action directive if the conversation is concluded.
 * **SMS Mode:** Return brief, text-only summaries.
 
+> [!WARNING]
+> **Mandatory show_widget Call:** To display a widget card on the companion UI when a tool executes, the tool **must explicitly call** `tool_context.show_widget(widget_template_id, data)`. Simply returning `{"widget": "widget_name"}` or similar keys in the tool's output dictionary **will not** trigger widget rendering. The backend runtime requires the `show_widget` method call to append the visual action payload to the active session context's execution queue.
+
+
 ---
 
 ## 🛠️ Code Blueprints & Standard Formats

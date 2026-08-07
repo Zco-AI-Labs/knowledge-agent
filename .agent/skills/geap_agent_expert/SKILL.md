@@ -27,7 +27,8 @@ We use a segregated, decoupled directory layout (the staged standard) for settin
 
 ```text
 my-agent/
-├── agents-cli-manifest.yaml # REQUIRED: agents-cli manifest
+├── config.json              # REQUIRED: Developer-defined custom manifest parameters
+├── agents-cli-manifest.yaml # REQUIRED: agents-cli manifest (updated dynamically by deploy.py)
 ├── deploy.py               # REQUIRED: Subprocess wrapper to run agents-cli deploy
 ├── pyproject.toml          # REQUIRED: uv dependency manager configuration
 └── app/                    # REQUIRED: Agent directory containing python code
@@ -60,6 +61,9 @@ We support two distinct agent archetypes under GEAP:
 | **Disabled BuiltinTools** | Disables 10 BuiltinTools (including `START_SUBAGENT` and `ASK_QUESTION`). | Disables 8 BuiltinTools (retains `START_SUBAGENT` and `ASK_QUESTION`). |
 | **Tool loading** | Supports camelCase fallback in `load_local_tools` for legacy tools. | Strict snake_case tool mapping only. |
 | **Requirements** | No `SKILL.md` is required. | `SKILL.md` is strictly REQUIRED. |
+
+### LLM-Optimized Agent Descriptions
+To ensure subagents are discovered and routed correctly by the Host Orchestrator's LLM, developers **MUST** provide direct, clean, and functionally descriptive strings for `description` in `agent.py`. Avoid generic prefixes (such as `"Managed GEAP agent for..."`). Instead, describe direct actions and data sources (e.g. `"Searches the Hubscape internal Shared RAG corpus to answer user questions using scraped websites, files, and YouTube video transcripts."`).
 
 ### camelCase Tool Loading Fallback
 If any script tool exports a camelCase function name (e.g., `consult_agent.py` → `consultAgent`), add a camelCase fallback to `load_local_tools` in your agent. See `host-agent/agent.py` lines 24-28 for the pattern. For subagents, stick to snake_case matching.
@@ -168,7 +172,7 @@ tools = load_local_tools(scripts_dir)
 root_agent = AdkAgent(
     model='gemini-2.5-flash',
     name='my_special_agent',
-    description='Managed GEAP agent.',
+    description='[LLM-Optimized Description: Describe clearly what this agent does (e.g. "Manages tasks and reminders.") so the host orchestrator can discover it. Avoid generic prefixes like "Managed GEAP agent."]',
     instruction=system_instruction,
     tools=tools
 )
@@ -284,7 +288,77 @@ my_special_agent_app = MySpecialAgent()
 ### 2. Packaging and Deploying (`deploy.py`)
 Deploying an agent as a Vertex AI Reasoning Engine involves a script that calls the containerized `agents-cli deploy` command.
 
-We use a standard root-level `deploy.py` script that acts as a wrapper to execute `agents-cli deploy` via a subprocess:
+To prevent developer-defined parameters under the `create_params` block in `agents-cli-manifest.yaml` from being overwritten when running template updates (`hubscape-adk -u`), custom options must be defined in `config.json` in the root of the repository:
+
+```json
+{
+  "agents-cli-manifest": {
+    "create_params": {
+      "deployment_target": "agent_runtime",
+      "is_a2a": true,
+      "session_type": "in_memory",
+      "cicd_runner": "skip",
+      "include_data_ingestion": false,
+      "datastore": "none",
+      "agent_guidance_filename": "GEMINI.md"
+    }
+  }
+}
+```
+
+Below are three examples of how different agents are configured using different parameter values in `config.json`:
+
+#### Example 1: Knowledge Agent (RAG Corpus Datastore)
+```json
+{
+  "agents-cli-manifest": {
+    "create_params": {
+      "deployment_target": "agent_runtime",
+      "is_a2a": true,
+      "session_type": "in_memory",
+      "cicd_runner": "skip",
+      "include_data_ingestion": true,
+      "datastore": "projects/hubscape-geap/locations/us-central1/ragCorpora/8331289874728484864",
+      "agent_guidance_filename": "GEMINI.md"
+    }
+  }
+}
+```
+
+#### Example 2: Onboarding Agent (Vertex AI Session Service)
+```json
+{
+  "agents-cli-manifest": {
+    "create_params": {
+      "deployment_target": "agent_runtime",
+      "is_a2a": true,
+      "session_type": "vertex_ai_session_service",
+      "cicd_runner": "skip",
+      "include_data_ingestion": false,
+      "datastore": "none",
+      "agent_guidance_filename": "GEMINI.md"
+    }
+  }
+}
+```
+
+#### Example 3: Host (Vertex AI Memory Bank)
+```json
+{
+  "agents-cli-manifest": {
+    "create_params": {
+      "deployment_target": "agent_runtime",
+      "is_a2a": true,
+      "cicd_runner": "skip",
+      "include_data_ingestion": true,
+      "datastore": "vertex_ai_memory_bank",
+      "agent_guidance_filename": "GEMINI.md"
+    }
+  }
+}
+```
+
+We use a standard root-level `deploy.py` script that acts as a wrapper. It automatically merges the parameters from `config.json` into `agents-cli-manifest.yaml` before running the `agents-cli deploy` command via a subprocess:
 
 ```python
 import os
@@ -497,21 +571,33 @@ GEAP agents read, write, and delete documents within Firestore using a scoping p
 
 ## 🛠️ Model Context Protocol (MCP) Integration
 * **No Monolithic Tool Registry:** We no longer manage local MCP server processes or a monolithic `ToolRegistry` on the backend.
-* **Implementation:** If a GEAP agent requires tool capability from an MCP server, either convert those MCP tools into standard Python functions inside the agent's `scripts/` folder, or write an outbound HTTP/SSE client within a tool in `scripts/` that connects to a hosted remote MCP server.
+* **Implementation via McpToolset (Standard):** Register the remote MCP server in `config.json` under `mcp_servers` with an `openid_configuration` and dynamic headers (e.g. `"Authorization": "Bearer ${OAUTH_TOKEN:provider}"`). In `app/agent.py`, load the server statically using `McpToolset`. The central platform and sandbox will automatically manage OAuth connections, refresh expired tokens, filter whitelisted tools, and expose them directly to the Gemini LLM.
+* **Outbound HTTP/SSE Fallback:** If you need to make custom programmatic connections, write a Python tool script that uses an HTTP client to communicate with the remote server.
 
 ---
 
-## 🔍 Google Search Grounding (Websearch)
-* **Legacy Toggle:** The Firestore-based `allow_web_search` toggle is decommissioned.
-* **Option A (Native Grounding):** To enable native Google Search grounding, add the `GoogleSearchRetrieval` tool directly to your agent's config inside `agent.py`:
-  ```python
-  from vertexai.preview.generative_models import Tool, grounding
-  google_search_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
-  # Append to your tools configuration
-  root_agent.tools = load_local_tools(scripts_dir) + [google_search_tool]
+## 🔍 Google Search Grounding & Google Maps Grounding
+* **`config.json` Toggles (Recommended)**: Set `"allow_web_search": true` or `"allow_google_maps": true` in `config.json`:
+  ```json
+  {
+    "allow_web_search": false,
+    "allow_google_maps": false
+  }
   ```
-  Ensure `google-cloud-aiplatform` is specified in your `pyproject.toml` dependencies.
-* **Option B (Custom Tool):** Write a custom search function tool inside `scripts/web_search.py` that queries custom search engines or scrapers, returning formatted results.
+  `app/agent.py` automatically resolves these toggles and injects `from google.adk.tools import google_search, google_maps_grounding`.
+
+* **Architectural Guidelines (When to Use Which)**:
+  - **`allow_web_search: true` (Recommended for Navigation & Factual Queries)**:
+    - **Use For**: Real-time web intelligence, factual Q&A, box office schedules, news, and **all general navigation queries** (calculating driving distance in miles, travel times, highway routes, and transit directions).
+    - **Why**: Google Search Grounding calculates travel times and driving distances from address strings with 100% reliability.
+  - **`allow_google_maps: true` (Reserved for Dedicated Spatial/Place Agents)**:
+    - **Use For**: Geo-spatial place discovery, business details (ratings, opening hours, phone numbers, exact place IDs), and finding nearby amenities relative to coordinates (*"Find 3 nearby coffee shops or parking garages"*).
+    - **Why**: Google Maps Grounding is designed for place entity lookups and map pin rendering. **Do NOT use `allow_google_maps` for general driving distance or travel time Q&A.**
+
+* **Native ADK Tools**:
+  - Web Search: `from google.adk.tools import google_search` (`GoogleSearchTool`)
+  - Google Maps: `from google.adk.tools import google_maps_grounding` (`GoogleMapsGroundingTool`)
+* **Dual Spatial Context**: When location context is supplied (`user_location`, `hub_location`), `GEAPAgentWrapper` automatically formats a `[SPATIAL & LOCATION CONTEXT]` instruction header for Gemini models and A2A subagent calls.
 
 ---
 

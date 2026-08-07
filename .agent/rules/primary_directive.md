@@ -8,20 +8,20 @@
 To ensure clean deployment and ingestion by the Hubscape platform, this repository follows the **Pure Agent Principle**:
 * Only modify the core files accepted by the GitOps ingestion pipeline:
   * `config.json` (At root: Metadata, RBAC permissions, UI settings, Secrets declarations)
-  * `agents/{agent_id}/` package:
+  * `app/` package folder:
     * `__init__.py` (Standard initialization exposing the `root_agent`)
-    * `agent.py` (LlmAgent setup)
-    * `prompt.py` (Contains `SYSTEM_PROMPT` string)
-    * `tools.py` (Python functions acting as tools)
-    * `api.py` (FastAPI route handlers)
+    * `agent.py` (LlmAgent and app wrapper setup)
+    * `SKILL.md` (Contains LLM instructions/prompts)
+    * `scripts/` (Contains standalone Python tool scripts)
+    * `static/` (Contains local static HTML/CSS/images/iframes)
+    * `ui/widgets/` (Contains custom Lego UI JSON widgets)
     * `pyproject.toml` (Package config and dependency listings)
-  * `widgets/` (Optional custom Lego UI JSON widgets)
-  * `static/` (Optional static asset files and iframes)
 * Do **NOT** commit, modify, or reference any local sandbox test files (`local_db.json`, `.env`, `.agent/`, or virtual environment folders) in your production logic.
 
 ## 2. Model Context Protocol (MCP) & Agent-to-Agent (A2A) Connections
 Custom agents must route all external connections and tool calls through the standardized platform interfaces:
-* **Programmatic MCP Calls:** When manually calling tools from whitelisted `mcp_servers` in Python logic, load the configuration relative to the agent folder dynamically and invoke using the context tool client:
+* **Standard MCP Servers (Direct Model Tooling):** Register remote MCP servers in `config.json` under `mcp_servers` with the `openid_configuration` and dynamic headers (e.g. `"${OAUTH_TOKEN:provider}"`). In `app/agent.py`, load these servers statically using `McpToolset` so that the tools are auto-discovered, whitelisted, and presented directly to the Gemini LLM.
+* **Programmatic MCP Calls:** When manually calling tools from whitelisted `mcp_servers` in custom Python logic, load the configuration relative to the agent folder dynamically and invoke using the context tool client:
   ```python
   import os
   import json
@@ -48,14 +48,14 @@ Custom agents must route all external connections and tool calls through the sta
   ```
 
 ## 3. Database Scoping & Index-Free Queries
-* **Scoping Helper Paths:** Always read and write to Firestore collections using platform-provided scope context helper methods on `context` (e.g. `context.save_agent_data`, `context.get_agent_data`, `context.delete_agent_data`, `context.list_agent_data`).
+* **Scoping Helper Paths:** Always read and write to Firestore collections using platform-provided scope context helper methods on `context` (e.g. `context.save()`, `context.get()`, `context.list()`, `context.delete()`).
 * **NO Custom Indexes:** You are strictly forbidden from writing query code that requires custom composite index definitions. All database searches must use in-memory sorting or denormalized composite keys to guarantee full compliance with the platform's **Index-Free Database Query Guidelines**.
 
 ## 4. Platform Secrets Vault Fallback
 * Never hardcode API keys, tokens, or credentials in files.
 * Retrieve all external credentials using the sandbox-safe fallback pattern:
   ```python
-  api_key = await context.get_agent_secret("KEY_NAME") or os.environ.get("KEY_NAME")
+  api_key = context.raw_context.get("secrets", {}).get("KEY_NAME") or os.environ.get("KEY_NAME")
   ```
 
 ## 5. Event Logging & Telemetry

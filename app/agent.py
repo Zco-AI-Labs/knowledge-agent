@@ -24,6 +24,39 @@ scripts_dir = os.path.join(runtime_dir, "scripts")
 system_tools_dir = os.path.join(runtime_dir, "core", "system_tools")
 tools = load_local_tools(system_tools_dir) + load_local_tools(scripts_dir)
 
+allow_web_search = True
+allow_google_maps = False
+
+config_json_path = os.path.join(os.path.dirname(runtime_dir), "config.json")
+if os.path.exists(config_json_path):
+    try:
+        import json
+        with open(config_json_path, "r", encoding="utf-8") as cf:
+            config_data = json.load(cf)
+            if "allow_web_search" in config_data or "allowWebSearch" in config_data:
+                allow_web_search = bool(config_data.get("allow_web_search") if "allow_web_search" in config_data else config_data.get("allowWebSearch"))
+            if "allow_google_maps" in config_data or "allowGoogleMaps" in config_data:
+                allow_google_maps = bool(config_data.get("allow_google_maps") if "allow_google_maps" in config_data else config_data.get("allowGoogleMaps"))
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to read/parse config.json: {e}")
+
+if allow_web_search:
+    try:
+        from google.adk.tools import google_search
+        tools.append(google_search)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to import google_search tool: {e}")
+
+if allow_google_maps:
+    try:
+        from google.adk.tools import google_maps_grounding
+        tools.append(google_maps_grounding)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to import google_maps_grounding tool: {e}")
+
 from app.app_utils.vertex_gemini import get_model
 
 root_agent = AdkAgent(
