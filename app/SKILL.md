@@ -1,6 +1,6 @@
 ---
 name: knowledge_agent
-description: "An agent that performs RAG knowledge search across the shared corpus and answers user queries with grounded database search results."
+description: "Universal knowledge base agent for answering user inquiries, factual questions, organization details, and reference topics."
 allowedRoles: ["member", "Hub Admin"]
 ---
 
