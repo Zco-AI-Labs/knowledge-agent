@@ -28,14 +28,23 @@ async def search_knowledge(query: str) -> dict:
         return {"status": "error", "message": "No Hub ID or Org ID found in context."}
 
     try:
-        # Get shared corpus ID from settings/platform
+        # Get shared corpus ID from settings/platform (with sharding support)
         db_client = context._db_client
         platform_ref = db_client.collection('settings').document('platform')
         platform_snap = await asyncio.to_thread(platform_ref.get)
 
         corpus_id = None
         if platform_snap.exists:
-            corpus_id = (platform_snap.to_dict() or {}).get("rag_corpus_id")
+            platform_data = platform_snap.to_dict() or {}
+            shards = platform_data.get("rag_corpus_shards")
+            if shards and isinstance(shards, list) and len(shards) > 0:
+                import hashlib
+                routing_key = str(hub_id or org_id or "default")
+                shard_idx = int(hashlib.md5(routing_key.encode("utf-8")).hexdigest(), 16) % len(shards)
+                corpus_id = shards[shard_idx]
+                logger.info(f"[knowledge_agent] Routed '{routing_key}' to RAG shard {shard_idx}/{len(shards)}: {corpus_id}")
+            else:
+                corpus_id = platform_data.get("rag_corpus_id")
 
         if not corpus_id:
             return {"status": "error", "message": "Shared RAG Corpus is not configured on the platform."}
