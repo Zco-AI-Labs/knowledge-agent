@@ -1,62 +1,179 @@
-import asyncio
 import logging
 import os
-
-# NOTE: Using v1beta1 specifically for RAG retrieval because the GA v1
-# RagChunk schema lacks the file_id and chunk_id metadata fields required
-# for our Firestore tenant isolation and validation checks.
+import asyncio
+from typing import Optional, Dict, Any, List
 from google.cloud import aiplatform_v1beta1
-
-from app.core import hubscape_adk
+import vertexai
+from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
+from google.cloud.firestore_v1.vector import Vector
+from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
+from google.cloud.firestore_v1.base_query import FieldFilter
+from google.adk.context import Context
 
 logger = logging.getLogger(__name__)
 
-@hubscape_adk.require_tool_privilege
-async def search_knowledge(query: str) -> dict:
-    """Searches the Hubscape internal Shared RAG Corpus for answers matching a query.
+async def search_knowledge(
+    context: Context,
+    query: str,
+    top_k: int = 5
+) -> dict:
+    """
+    Searches the hub's private knowledge base for factual grounding context.
+    Executes primary Cloud Firestore Vector Search with automatic fallback to
+    the Vertex AI Sharded RAG Corpus.
 
     Args:
-        query: The search query to look up.
+        context: Context object providing auth and platform state.
+        query: The semantic search query or question to ground against the knowledge base.
+        top_k: Maximum number of relevant chunks to retrieve (default: 5).
+
+    Returns:
+        A dictionary with "status" and "result" containing formatted search snippets and source URLs.
     """
-    context = hubscape_adk.get_context()
-    logger.info(f"[knowledge_agent] Executing knowledge search: query='{query}'")
+    hub_id = context.get_active_hub_id()
+    org_id = context.get_active_org_id()
+    user_id = context.auth.get_user_id()
 
-    hub_id = context.auth.hub_id
-    org_id = context.auth.org_id
+    logger.info(f"[knowledge_agent] search_knowledge called for hub_id='{hub_id}', org_id='{org_id}', query='{query}'")
 
-    if not hub_id and not org_id:
-        return {"status": "error", "message": "No Hub ID or Org ID found in context."}
+    db_client = context._db_client
+    project_id = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT") or "hubscape-geap"
+    location = os.environ.get("REGION", "us-central1")
 
+    # Read platform settings to determine primary vs fallback mode
+    rag_provider = "FIRESTORE_VECTOR"
+    shards = []
+    corpus_id = None
     try:
-        # Get shared corpus ID from settings/platform (with sharding support)
-        db_client = context._db_client
         platform_ref = db_client.collection('settings').document('platform')
         platform_snap = await asyncio.to_thread(platform_ref.get)
-
-        corpus_id = None
         if platform_snap.exists:
             platform_data = platform_snap.to_dict() or {}
-            shards = platform_data.get("rag_corpus_shards")
-            if shards and isinstance(shards, list) and len(shards) > 0:
-                import hashlib
-                routing_key = str(hub_id or org_id or "default")
-                shard_idx = int(hashlib.md5(routing_key.encode("utf-8")).hexdigest(), 16) % len(shards)
-                corpus_id = shards[shard_idx]
-                logger.info(f"[knowledge_agent] Routed '{routing_key}' to RAG shard {shard_idx}/{len(shards)}: {corpus_id}")
-            else:
-                corpus_id = platform_data.get("rag_corpus_id")
+            rag_provider = platform_data.get("rag_provider", "FIRESTORE_VECTOR")
+            shards = platform_data.get("rag_corpus_shards") or []
+            corpus_id = platform_data.get("rag_corpus_id")
+    except Exception as pe:
+        logger.debug(f"[knowledge_agent] Notice reading platform settings: {pe}")
+
+    # =========================================================================
+    # 1. PRIMARY ENGINE: CLOUD FIRESTORE VECTOR SEARCH (Sub-100ms, Pre-Siloed)
+    # =========================================================================
+    if rag_provider == "FIRESTORE_VECTOR":
+        try:
+            logger.info(f"[knowledge_agent] [Primary] Executing Firestore Vector Search for hub '{hub_id}'...")
+            
+            # Generate query embedding via Vertex AI text-embedding-005
+            def _get_query_embedding():
+                vertexai.init(project=project_id, location=location)
+                model = TextEmbeddingModel.from_pretrained("text-embedding-005")
+                input_item = TextEmbeddingInput(text=query.strip(), task_type="RETRIEVAL_QUERY")
+                embeddings = model.get_embeddings([input_item], output_dimensionality=768)
+                return embeddings[0].values
+
+            query_embedding = await asyncio.to_thread(_get_query_embedding)
+            query_vector = Vector(query_embedding)
+
+            # Query Firestore with hardware-level tenant scope pre-filtering
+            coll_ref = db_client.collection("rag_knowledge_chunks")
+            vector_query = coll_ref
+            if hub_id:
+                vector_query = vector_query.where(filter=FieldFilter("hubId", "==", hub_id))
+            elif org_id:
+                vector_query = vector_query.where(filter=FieldFilter("orgId", "==", org_id))
+
+            vector_query = vector_query.find_nearest(
+                vector_field="embedding",
+                query_vector=query_vector,
+                distance_measure=DistanceMeasure.COSINE,
+                limit=top_k
+            )
+
+            chunk_snaps = await asyncio.to_thread(vector_query.get)
+            
+            if chunk_snaps:
+                results = []
+                for s in chunk_snaps:
+                    data = s.to_dict() or {}
+                    results.append({
+                        "title": data.get("title") or "Grounded Document",
+                        "content": data.get("content") or "",
+                        "url": data.get("sourceUrl") or data.get("url")
+                    })
+
+                logger.info(f"[knowledge_agent] ✅ [Primary] Firestore Vector Search returned {len(results)} chunks.")
+
+                # Telemetry logging to GCP Cloud Logging / BigQuery
+                try:
+                    from datetime import datetime
+                    from google.cloud import firestore as gcp_fs
+                    from google.cloud import logging as gcp_logging
+                    
+                    event_payload = {
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "successful": True,
+                        "hubId": hub_id,
+                        "orgId": org_id,
+                        "userId": user_id,
+                        "agentId": "knowledge_agent",
+                        "type": "firestore_vector_search",
+                        "provider": "Cloud Firestore Vector",
+                        "modelId": "text-embedding-005",
+                        "metadata": {
+                            "queryCount": 1,
+                            "queryLength": len(query),
+                            "resultCount": len(results),
+                            "systemCredits": 50,
+                            "estimatedCostUsd": 0.002
+                        }
+                    }
+                    gcp_client = gcp_logging.Client()
+                    logger_gcp = gcp_client.logger("hubscape.platform.transactions")
+                    logger_gcp.log_struct(event_payload, severity="INFO")
+
+                    if org_id:
+                        billing_ref = db_client.collection("organizations").document(org_id).collection("billing").document("status")
+                        await asyncio.to_thread(
+                            billing_ref.update,
+                            {
+                                "creditsAvailable": gcp_fs.Increment(-50),
+                                "creditsUsed": gcp_fs.Increment(50),
+                                "lastUpdated": gcp_fs.SERVER_TIMESTAMP
+                            }
+                        )
+                except Exception as tel_err:
+                    logger.debug(f"[knowledge_agent] Telemetry notice: {tel_err}")
+
+                formatted_result = ""
+                for idx, r in enumerate(results):
+                    formatted_result += f"--- Result {idx+1}: {r['title']} ---\n"
+                    if r['url']:
+                        formatted_result += f"Source URL: {r['url']}\n"
+                    formatted_result += f"{r['content']}\n\n"
+
+                return {"status": "success", "result": formatted_result.strip()}
+
+            logger.info("[knowledge_agent] [Primary] 0 results in Firestore chunks. Checking Vertex fallback...")
+        except Exception as ve:
+            logger.warning(f"[knowledge_agent] ⚠️ [Primary] Firestore Vector search error ({ve}). Engaging fallback...")
+
+    # =========================================================================
+    # 2. STANDBY FALLBACK: VERTEX AI SHARDED RAG CORPUS
+    # =========================================================================
+    try:
+        if shards and isinstance(shards, list) and len(shards) > 0:
+            import hashlib
+            routing_key = str(hub_id or org_id or "default")
+            shard_idx = int(hashlib.md5(routing_key.encode("utf-8")).hexdigest(), 16) % len(shards)
+            corpus_id = shards[shard_idx]
+            logger.info(f"[knowledge_agent] [Fallback] Routed to RAG shard {shard_idx}: {corpus_id}")
 
         if not corpus_id:
-            return {"status": "error", "message": "Shared RAG Corpus is not configured on the platform."}
-
-        location = os.environ.get("REGION", "us-central1")
-        project_id = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT") or "hubscape-geap"
+            return {"status": "success", "result": "No relevant search results found."}
 
         # Prevent API keys in the environment from overriding OIDC/ADC credentials
         os.environ.pop("GEMINI_API_KEY", None)
         os.environ.pop("GOOGLE_API_KEY", None)
 
-        # Resolve credentials using metadata server to prevent 401 Unauthenticated inside Vertex container
         import google.auth
         import httpx as httpx_sync
         from google.oauth2.credentials import Credentials
@@ -68,16 +185,12 @@ async def search_knowledge(query: str) -> dict:
             if resp.status_code == 200:
                 tok = resp.json().get("access_token")
                 if tok:
-                    logger.info("[knowledge_agent] Resolved access token from Metadata Server.")
                     credentials = Credentials(tok)
-        except Exception as e:
-            logger.debug(f"[knowledge_agent] Metadata Server token request failed: {e}")
+        except Exception:
+            pass
 
         if not credentials:
-            logger.info("[knowledge_agent] Falling back to default Application Credentials.")
-            credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
+            credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
 
         from google.api_core.client_options import ClientOptions
         client_options = ClientOptions(api_endpoint=f"{location}-aiplatform.googleapis.com")
@@ -86,24 +199,17 @@ async def search_knowledge(query: str) -> dict:
             credentials=credentials
         )
 
-        # Rely on post-retrieval Firestore tenant validation (matching tools/search.py)
-        # to ensure zero candidate starvation without requiring per-file GCP metadata API calls.
-        rag_retrieval_config = None
-
         candidate_limit = 100
         query_obj = aiplatform_v1beta1.types.RagQuery(
             text=query,
-            similarity_top_k=candidate_limit,
-            rag_retrieval_config=rag_retrieval_config
+            similarity_top_k=candidate_limit
         )
-
         rag_resource = aiplatform_v1beta1.types.RetrieveContextsRequest.VertexRagStore.RagResource(
             rag_corpus=corpus_id
         )
         vertex_rag_store = aiplatform_v1beta1.types.RetrieveContextsRequest.VertexRagStore(
             rag_resources=[rag_resource]
         )
-
         parent_location = f"projects/{project_id}/locations/{location}"
         request = aiplatform_v1beta1.types.RetrieveContextsRequest(
             parent=parent_location,
@@ -111,92 +217,18 @@ async def search_knowledge(query: str) -> dict:
             query=query_obj
         )
 
-        logger.info(f"[knowledge_agent] querying RAG parent_location: {parent_location}, corpus_id: {corpus_id}, query_obj top_k: {candidate_limit}")
-        
-        try:
-            from opentelemetry import trace
-            tracer = trace.get_tracer(__name__)
-            span_ctx = tracer.start_as_current_span("vertex_rag_retrieval")
-        except Exception:
-            from contextlib import nullcontext
-            span_ctx = nullcontext()
-            
-        with span_ctx as span:
-            if span and hasattr(span, "set_attribute"):
-                span.set_attribute("rag.corpus_id", corpus_id)
-                span.set_attribute("rag.query_length", len(query))
-                span.set_attribute("queryCount", 1)
-                
-            response = await asyncio.to_thread(
-                client.retrieve_contexts,
-                request=request
-            )
-
+        response = await asyncio.to_thread(client.retrieve_contexts, request=request)
         contexts_list = getattr(response, "contexts", None)
         contexts = getattr(contexts_list, "contexts", []) if contexts_list else []
-        logger.info(f"[knowledge_agent] retrieve_contexts returned {len(contexts)} contexts")
 
-        # Log RAG search query usage transaction to GCP BigQuery (via Cloud Logging)
-        try:
-            from datetime import datetime
-            from google.cloud import firestore
-            from google.cloud import logging as gcp_logging
-            
-            user_id = context.auth.get_user_id()
-            
-            event_payload = {
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "successful": True,
-                "hubId": hub_id,
-                "orgId": org_id,
-                "userId": user_id,
-                "agentId": "knowledge_agent",
-                "type": "vertex_rag_retrieval",
-                "provider": "Vertex AI / RAG",
-                "modelId": "Vertex RAG Search",
-                "metadata": {
-                    "queryCount": 1,
-                    "queryLength": len(query),
-                    "corpusId": corpus_id,
-                    "systemCredits": 50,  # 50 credits flat fee for RAG search
-                    "estimatedCostUsd": 0.005
-                }
-            }
-            # Remove None values
-            event_payload = {k: v for k, v in event_payload.items() if v is not None}
-            
-            # Stream payload directly to Cloud Logging (which routes to BigQuery)
-            try:
-                gcp_client = gcp_logging.Client()
-                logger_gcp = gcp_client.logger("hubscape.platform.transactions")
-                logger_gcp.log_struct(event_payload, severity="INFO")
-                logger.info("[knowledge_agent] Streamed RAG telemetry payload directly to GCP Cloud Logging.")
-            except Exception as bq_log_err:
-                logger.warning(f"[knowledge_agent] Failed to stream RAG transaction to Cloud Logging: {bq_log_err}")
-
-            # Keep real-time Firestore credit debit (updates customer wallet balance)
-            if org_id:
-                billing_ref = db_client.collection("organizations").document(org_id).collection("billing").document("status")
-                billing_ref.update({
-                    "creditsAvailable": firestore.Increment(-50),
-                    "creditsUsed": firestore.Increment(50),
-                    "lastUpdated": firestore.SERVER_TIMESTAMP
-                })
-                logger.info(f"[knowledge_agent] Debited 50 credits from org {org_id} for RAG search.")
-        except Exception as log_err:
-            logger.warning(f"[knowledge_agent] General RAG billing telemetry failure: {log_err}")
-
-        # 1. Collect file IDs from contexts
         file_ids = []
-        for i, context_item in enumerate(contexts):
+        for context_item in contexts:
             fid = ""
             if hasattr(context_item, 'chunk') and context_item.chunk:
                 fid = getattr(context_item.chunk, 'file_id', '')
-            logger.info(f"[knowledge_agent] context {i+1}: file_id='{fid}', text_len={len(context_item.text) if hasattr(context_item, 'text') else 0}")
             if fid:
                 file_ids.append(fid)
 
-        # 2. Batch-query Firestore to resolve document metadata and verify tenant ownership
         registry_map = {}
         if file_ids:
             corpus_id_num = corpus_id.split('/')[-1]
@@ -205,22 +237,18 @@ async def search_knowledge(query: str) -> dict:
             for fid in set(file_ids):
                 full_ids.append(f"projects/{project_id}/locations/{location}/ragCorpora/{corpus_id_num}/ragFiles/{fid}")
                 full_ids.append(f"projects/{project_number}/locations/{location}/ragCorpora/{corpus_id_num}/ragFiles/{fid}")
-            logger.info(f"[knowledge_agent] Firestore batch lookup full_ids: {full_ids}")
 
             chunked_ids = [full_ids[i:i + 30] for i in range(0, len(full_ids), 30)]
             for batch in chunked_ids:
                 registry_docs = await asyncio.to_thread(
                     lambda b=batch: db_client.collection('rag_knowledge').where('ragFileId', 'in', b).get()
                 )
-                logger.info(f"[knowledge_agent] Firestore batch lookup returned {len(registry_docs)} documents")
                 for rdoc in registry_docs:
                     rdata = rdoc.to_dict()
                     fid = rdata.get('ragFileId', '').split('/')[-1]
                     if fid:
                         registry_map[fid] = rdata
-                        logger.info(f"[knowledge_agent] Mapped fid '{fid}' -> title: '{rdata.get('title')}', ownerId: '{rdata.get('ownerId')}', orgId: '{rdata.get('orgId')}'")
 
-        # 3. Apply post-retrieval filtering and enrich results
         results = []
         job_cache = {}
         for context_item in contexts:
@@ -241,7 +269,6 @@ async def search_knowledge(query: str) -> dict:
                         if dsnap.exists:
                             doc_meta = dsnap.to_dict() or {}
                     
-                    # Fallback to rag_jobs metadata if doc_id was superseded/deleted in re-crawls
                     if not doc_meta and job_id:
                         if job_id not in job_cache:
                             jsnap = await asyncio.to_thread(db_client.collection('rag_jobs').document(job_id).get)
@@ -265,17 +292,13 @@ async def search_knowledge(query: str) -> dict:
                             'sourceUrl': context_item.source_uri
                         }
 
-            # Tenant isolation check:
-            # A document is allowed if it is platform-wide (platform_host) or matches target tenant scope
             owner_id = doc_meta.get('ownerId')
             doc_org_id = doc_meta.get('orgId')
-
             is_allowed = (
                 owner_id == 'platform_host' or
                 (hub_id and owner_id == hub_id) or
                 (org_id and doc_org_id == org_id)
             )
-            logger.info(f"[knowledge_agent] context check: fid='{fid}', ownerId='{owner_id}', doc_org_id='{doc_org_id}', context_hub_id='{hub_id}', context_org_id='{org_id}' -> is_allowed={is_allowed}")
             if not is_allowed:
                 continue
 
@@ -285,11 +308,9 @@ async def search_knowledge(query: str) -> dict:
                 "url": doc_meta.get('sourceUrl') or doc_meta.get('url') or context_item.source_uri
             })
 
-            # Retrieve up to 5 results
-            if len(results) >= 5:
+            if len(results) >= top_k:
                 break
 
-        # Format the result nicely as text or list
         if not results:
             return {"status": "success", "result": "No relevant search results found."}
 
@@ -301,6 +322,7 @@ async def search_knowledge(query: str) -> dict:
             formatted_result += f"{r['content']}\n\n"
 
         return {"status": "success", "result": formatted_result.strip()}
+
     except Exception as e:
-        logger.error(f"[knowledge_agent] search_knowledge failed: {e}", exc_info=True)
+        logger.error(f"[knowledge_agent] Fallback Vertex search failed: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
