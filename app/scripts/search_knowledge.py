@@ -222,6 +222,7 @@ async def search_knowledge(query: str) -> dict:
 
         # 3. Apply post-retrieval filtering and enrich results
         results = []
+        job_cache = {}
         for context_item in contexts:
             fid = ""
             if hasattr(context_item, 'chunk') and context_item.chunk:
@@ -231,12 +232,38 @@ async def search_knowledge(query: str) -> dict:
             if not doc_meta and hasattr(context_item, 'source_uri') and context_item.source_uri:
                 s_uri = context_item.source_uri or ""
                 if "rag_batch_imports" in s_uri:
-                    filename = s_uri.split('/')[-1]
+                    parts = s_uri.split('rag_batch_imports/')[1].split('/')
+                    job_id = parts[0] if parts else ""
+                    filename = parts[-1]
                     d_id = filename.split('_')[0]
                     if d_id:
                         dsnap = await asyncio.to_thread(db_client.collection('rag_knowledge').document(d_id).get)
                         if dsnap.exists:
                             doc_meta = dsnap.to_dict() or {}
+                    
+                    # Fallback to rag_jobs metadata if doc_id was superseded/deleted in re-crawls
+                    if not doc_meta and job_id:
+                        if job_id not in job_cache:
+                            jsnap = await asyncio.to_thread(db_client.collection('rag_jobs').document(job_id).get)
+                            job_cache[job_id] = jsnap.to_dict() if jsnap.exists else {}
+                        jdata = job_cache.get(job_id) or {}
+                        if jdata:
+                            raw_title = filename[len(d_id)+1:].rstrip('.md').replace('_', ' ') if d_id else (context_item.source_display_name or "Grounded Document")
+                            doc_meta = {
+                                'ownerId': jdata.get('hubId'),
+                                'orgId': jdata.get('orgId'),
+                                'title': raw_title or "Grounded Document",
+                                'sourceUrl': jdata.get('siteUrl') or context_item.source_uri
+                            }
+                elif "knowledge_uploads" in s_uri:
+                    parts = s_uri.split('knowledge_uploads/')[1].split('/')
+                    path_hub_id = parts[0] if parts else ""
+                    if path_hub_id:
+                        doc_meta = {
+                            'ownerId': path_hub_id,
+                            'title': context_item.source_display_name or "Uploaded Document",
+                            'sourceUrl': context_item.source_uri
+                        }
 
             # Tenant isolation check:
             # A document is allowed if it is platform-wide (platform_host) or matches target tenant scope
