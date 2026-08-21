@@ -16,16 +16,19 @@ logger = logging.getLogger(__name__)
 @hubscape_adk.tool_scope(["hub", "org"])
 async def search_knowledge(
     query: str,
-    top_k: int = 5
+    top_k: int = 10
 ) -> dict:
     """
     Searches the hub's private knowledge base for factual grounding context.
-    Executes primary Cloud Firestore Vector Search with automatic fallback to
-    the Vertex AI Sharded RAG Corpus.
+    Executes a 2-Stage Multi-Tenant Cloud Firestore Vector Search:
+    - Stage 1: Fetches a wide candidate net (20 chunks) for catalog-wide visibility.
+    - Stage 2: Applies in-flight document diversity & deduplication (max 2 chunks per page)
+      before synthesizing into LLM context.
+    Automatic fallback to the Vertex AI Sharded RAG Corpus if needed.
 
     Args:
         query: The semantic search query or question to ground against the knowledge base.
-        top_k: Maximum number of relevant chunks to retrieve (default: 5).
+        top_k: Maximum number of relevant diverse chunks to retrieve (default: 10).
 
     Returns:
         A dictionary with "status" and "result" containing formatted search snippets and source URLs.
@@ -44,7 +47,7 @@ async def search_knowledge(
         from google.cloud import firestore
         db_client = firestore.Client(project=os.environ.get("PROJECT_ID") or "hubscape-geap")
 
-    logger.info(f"[knowledge_agent] search_knowledge called for hub_id='{hub_id}', org_id='{org_id}', query='{query}'")
+    logger.info(f"[knowledge_agent] search_knowledge (2-Stage) called for hub_id='{hub_id}', org_id='{org_id}', query='{query}'")
 
     project_id = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT") or "hubscape-geap"
     location = os.environ.get("REGION", "us-central1")
@@ -65,11 +68,11 @@ async def search_knowledge(
         logger.debug(f"[knowledge_agent] Notice reading platform settings: {pe}")
 
     # =========================================================================
-    # 1. PRIMARY ENGINE: CLOUD FIRESTORE VECTOR SEARCH (Sub-100ms, Pre-Siloed)
+    # 1. PRIMARY ENGINE: 2-STAGE CLOUD FIRESTORE VECTOR SEARCH (20 -> Top 10 Diverse)
     # =========================================================================
     if rag_provider == "FIRESTORE_VECTOR":
         try:
-            logger.info(f"[knowledge_agent] [Primary] Executing Firestore Vector Search for hub '{hub_id}'...")
+            logger.info(f"[knowledge_agent] [Primary] Executing 2-Stage Firestore Vector Search (20-candidate net) for hub '{hub_id}'...")
             
             # Generate query embedding via Vertex AI text-embedding-005
             def _get_query_embedding():
@@ -82,7 +85,7 @@ async def search_knowledge(
             query_embedding = await asyncio.to_thread(_get_query_embedding)
             query_vector = Vector(query_embedding)
 
-            # Query Firestore with hardware-level tenant scope pre-filtering
+            # Stage 1: Query Firestore with wide 20-chunk candidate net
             coll_ref = db_client.collection("rag_knowledge_chunks")
             vector_query = coll_ref
             if hub_id:
@@ -90,26 +93,42 @@ async def search_knowledge(
             elif org_id:
                 vector_query = vector_query.where(filter=FieldFilter("orgId", "==", org_id))
 
+            candidate_fetch_limit = max(20, top_k * 2)
             vector_query = vector_query.find_nearest(
                 vector_field="embedding",
                 query_vector=query_vector,
                 distance_measure=DistanceMeasure.COSINE,
-                limit=top_k
+                limit=candidate_fetch_limit
             )
 
             chunk_snaps = await asyncio.to_thread(vector_query.get)
             
             if chunk_snaps:
-                results = []
+                raw_candidates = []
                 for s in chunk_snaps:
                     data = s.to_dict() or {}
-                    results.append({
+                    raw_candidates.append({
                         "title": data.get("title") or "Grounded Document",
                         "content": data.get("content") or "",
-                        "url": data.get("sourceUrl") or data.get("url")
+                        "url": data.get("sourceUrl") or data.get("url"),
+                        "parentDocId": data.get("parentDocId"),
+                        "chunkId": s.id
                     })
 
-                logger.info(f"[knowledge_agent] ✅ [Primary] Firestore Vector Search returned {len(results)} chunks.")
+                # Stage 2: In-flight Document Diversity Reranker (max 2 chunks per unique URL/Doc)
+                filtered_results = []
+                doc_counts = {}
+                for item in raw_candidates:
+                    doc_key = item["url"] or item["parentDocId"] or item["title"] or item["chunkId"]
+                    current_count = doc_counts.get(doc_key, 0)
+                    if current_count >= 2:
+                        continue
+                    doc_counts[doc_key] = current_count + 1
+                    filtered_results.append(item)
+                    if len(filtered_results) >= top_k:
+                        break
+
+                logger.info(f"[knowledge_agent] ✅ [Primary] 2-Stage Filter selected {len(filtered_results)} high-signal chunks across {len(doc_counts)} distinct pages.")
 
                 # Telemetry logging to GCP Cloud Logging / BigQuery
                 try:
@@ -130,7 +149,9 @@ async def search_knowledge(
                         "metadata": {
                             "queryCount": 1,
                             "queryLength": len(query),
-                            "resultCount": len(results),
+                            "candidateCount": len(raw_candidates),
+                            "resultCount": len(filtered_results),
+                            "distinctSources": len(doc_counts),
                             "systemCredits": 50,
                             "estimatedCostUsd": 0.002
                         }
@@ -153,7 +174,7 @@ async def search_knowledge(
                     logger.debug(f"[knowledge_agent] Telemetry notice: {tel_err}")
 
                 formatted_result = ""
-                for idx, r in enumerate(results):
+                for idx, r in enumerate(filtered_results):
                     formatted_result += f"--- Result {idx+1}: {r['title']} ---\n"
                     if r['url']:
                         formatted_result += f"Source URL: {r['url']}\n"
@@ -259,6 +280,7 @@ async def search_knowledge(
                         registry_map[fid] = rdata
 
         results = []
+        doc_counts = {}
         job_cache = {}
         for context_item in contexts:
             fid = ""
@@ -310,6 +332,12 @@ async def search_knowledge(
             )
             if not is_allowed:
                 continue
+
+            # Diversity filter for fallback branch (max 2 chunks per parent document)
+            doc_key = doc_meta.get('sourceUrl') or doc_meta.get('url') or doc_meta.get('id') or fid
+            if doc_counts.get(doc_key, 0) >= 2:
+                continue
+            doc_counts[doc_key] = doc_counts.get(doc_key, 0) + 1
 
             results.append({
                 "title": doc_meta.get('title') or context_item.source_display_name or "Grounded Document",
