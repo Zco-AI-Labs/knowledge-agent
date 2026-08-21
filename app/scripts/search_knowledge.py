@@ -8,12 +8,13 @@ from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
 from google.cloud.firestore_v1.vector import Vector
 from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
 from google.cloud.firestore_v1.base_query import FieldFilter
-from google.adk.context import Context
+from app.core import hubscape_adk
 
 logger = logging.getLogger(__name__)
 
+@hubscape_adk.require_tool_privilege
+@hubscape_adk.tool_scope(["hub", "org"])
 async def search_knowledge(
-    context: Context,
     query: str,
     top_k: int = 5
 ) -> dict:
@@ -23,20 +24,28 @@ async def search_knowledge(
     the Vertex AI Sharded RAG Corpus.
 
     Args:
-        context: Context object providing auth and platform state.
         query: The semantic search query or question to ground against the knowledge base.
         top_k: Maximum number of relevant chunks to retrieve (default: 5).
 
     Returns:
         A dictionary with "status" and "result" containing formatted search snippets and source URLs.
     """
-    hub_id = context.get_active_hub_id()
-    org_id = context.get_active_org_id()
-    user_id = context.auth.get_user_id()
+    try:
+        context = hubscape_adk.get_context()
+        hub_id = context.auth.hub_id
+        org_id = context.auth.org_id
+        user_id = context.auth.get_user_id()
+        db_client = context._db_client
+    except Exception as ce:
+        logger.warning(f"[knowledge_agent] Could not resolve RemoteContext ({ce}), using fallback defaults.")
+        hub_id = None
+        org_id = None
+        user_id = "unknown"
+        from google.cloud import firestore
+        db_client = firestore.Client(project=os.environ.get("PROJECT_ID") or "hubscape-geap")
 
     logger.info(f"[knowledge_agent] search_knowledge called for hub_id='{hub_id}', org_id='{org_id}', query='{query}'")
 
-    db_client = context._db_client
     project_id = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT") or "hubscape-geap"
     location = os.environ.get("REGION", "us-central1")
 
