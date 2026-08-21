@@ -1,6 +1,6 @@
 ---
 name: knowledge_agent
-description: "Universal knowledge base agent for searching organizational documents, scraped website knowledge, uploaded files, and reference topics."
+description: "Universal knowledge base and information specialist. Answers all user questions regarding workspace topics, business information, services, amenities, hours, policies, dining, menus, reservations, booking procedures, events, and documentation using the organization's verified knowledge base (scraped website pages, uploaded files, and media)."
 allowedRoles: ["member", "Hub Admin"]
 ---
 
