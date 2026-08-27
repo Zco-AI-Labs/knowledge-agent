@@ -90,26 +90,71 @@ async def search_knowledge(
             elif org_id:
                 vector_query = vector_query.where(filter=FieldFilter("orgId", "==", org_id))
 
+            # Stage 1: Fetch wide 20-candidate pool
+            fetch_limit = min(max(top_k * 4, 20), 40)
             vector_query = vector_query.find_nearest(
                 vector_field="embedding",
                 query_vector=query_vector,
                 distance_measure=DistanceMeasure.COSINE,
-                limit=top_k
+                limit=fetch_limit
             )
 
             chunk_snaps = await asyncio.to_thread(vector_query.get)
             
             if chunk_snaps:
-                results = []
+                raw_candidates = []
                 for s in chunk_snaps:
                     data = s.to_dict() or {}
-                    results.append({
+                    raw_candidates.append({
                         "title": data.get("title") or "Grounded Document",
                         "content": data.get("content") or "",
-                        "url": data.get("sourceUrl") or data.get("url")
+                        "url": data.get("sourceUrl") or data.get("url"),
+                        "parentDocId": data.get("parentDocId"),
+                        "chunkId": s.id
                     })
 
-                logger.info(f"[knowledge_agent] ✅ [Primary] Firestore Vector Search returned {len(results)} chunks.")
+                # Stage 1.5: Exact Entity & Title Affinity Boost
+                boosted_keys = set()
+                q_clean = query.lower().strip()
+                q_tokens = [w for w in re.findall(r'[a-zA-Z0-9_-]+', q_clean) if len(w) > 2]
+                
+                boosted_items = []
+                standard_items = []
+                for item in raw_candidates:
+                    title_lower = (item["title"] or "").lower()
+                    url_lower = (item["url"] or "").lower()
+                    
+                    is_match = False
+                    if any(tok in title_lower or tok in url_lower for tok in q_tokens):
+                        is_match = True
+                        doc_k = item["url"] or item["parentDocId"] or item["title"] or item["chunkId"]
+                        boosted_keys.add(doc_k)
+
+                    if is_match:
+                        boosted_items.append(item)
+                    else:
+                        standard_items.append(item)
+
+                ordered_candidates = boosted_items + standard_items
+
+                # Stage 2: Adaptive Document Diversity Reranker
+                results = []
+                doc_counts: Dict[str, int] = {}
+                for item in ordered_candidates:
+                    doc_key = item["url"] or item["parentDocId"] or item["title"] or item["chunkId"]
+                    current_count = doc_counts.get(doc_key, 0)
+                    
+                    # Allow up to 4 chunks for exact-match topics, 2 for broad discovery
+                    allowed_max = 4 if doc_key in boosted_keys else 2
+                    if current_count >= allowed_max:
+                        continue
+                    
+                    doc_counts[doc_key] = current_count + 1
+                    results.append(item)
+                    if len(results) >= top_k:
+                        break
+
+                logger.info(f"[knowledge_agent] ✅ [Primary] Firestore Vector Search returned {len(results)} high-signal chunks across {len(doc_counts)} sources.")
 
                 # Telemetry logging to GCP Cloud Logging / BigQuery
                 try:
