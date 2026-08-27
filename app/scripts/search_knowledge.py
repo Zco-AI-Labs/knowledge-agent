@@ -109,6 +109,7 @@ async def search_knowledge(
                         "title": data.get("title") or "Grounded Document",
                         "content": data.get("content") or "",
                         "url": data.get("sourceUrl") or data.get("url"),
+                        "allowDownload": data.get("allowDownload", True),
                         "parentDocId": data.get("parentDocId"),
                         "chunkId": s.id
                     })
@@ -200,8 +201,15 @@ async def search_knowledge(
                 formatted_result = ""
                 for idx, r in enumerate(results):
                     formatted_result += f"--- Result {idx+1}: {r['title']} ---\n"
-                    if r['url']:
-                        formatted_result += f"Source URL: {r['url']}\n"
+                    url = r.get('url')
+                    allow_download = r.get('allowDownload', True)
+                    if url:
+                        if url.startswith('/api/media/file') and allow_download:
+                            formatted_result += f"File Download / View Link: {url}\n"
+                        elif not url.startswith('file://') and not url.startswith('/api/media/file'):
+                            formatted_result += f"Source URL: {url}\n"
+                        elif not allow_download:
+                            formatted_result += f"Source: {r['title']} (Internal Grounding Only - Raw File Download Restricted)\n"
                     formatted_result += f"{r['content']}\n\n"
 
                 return {"status": "success", "result": formatted_result.strip()}
@@ -340,10 +348,13 @@ async def search_knowledge(
                     parts = s_uri.split('knowledge_uploads/')[1].split('/')
                     path_hub_id = parts[0] if parts else ""
                     if path_hub_id:
+                        import urllib.parse
+                        encoded_kpath = urllib.parse.quote(f"knowledge_uploads/{s_uri.split('knowledge_uploads/')[1]}", safe='')
                         doc_meta = {
                             'ownerId': path_hub_id,
                             'title': context_item.source_display_name or "Uploaded Document",
-                            'sourceUrl': context_item.source_uri
+                            'sourceUrl': f"/api/media/file?path={encoded_kpath}",
+                            'allowDownload': True
                         }
 
             owner_id = doc_meta.get('ownerId')
@@ -359,7 +370,8 @@ async def search_knowledge(
             results.append({
                 "title": doc_meta.get('title') or context_item.source_display_name or "Grounded Document",
                 "content": context_item.text,
-                "url": doc_meta.get('sourceUrl') or doc_meta.get('url') or context_item.source_uri
+                "url": doc_meta.get('sourceUrl') or doc_meta.get('url') or context_item.source_uri,
+                "allowDownload": doc_meta.get('allowDownload', True)
             })
 
             if len(results) >= top_k:
@@ -371,8 +383,15 @@ async def search_knowledge(
         formatted_result = ""
         for idx, r in enumerate(results):
             formatted_result += f"--- Result {idx+1}: {r['title']} ---\n"
-            if r['url']:
-                formatted_result += f"Source URL: {r['url']}\n"
+            url = r.get('url')
+            allow_download = r.get('allowDownload', True)
+            if url:
+                if url.startswith('/api/media/file') and allow_download:
+                    formatted_result += f"File Download / View Link: {url}\n"
+                elif not url.startswith('file://') and not url.startswith('/api/media/file'):
+                    formatted_result += f"Source URL: {url}\n"
+                elif not allow_download:
+                    formatted_result += f"Source: {r['title']} (Internal Grounding Only - Raw File Download Restricted)\n"
             formatted_result += f"{r['content']}\n\n"
 
         return {"status": "success", "result": formatted_result.strip()}
