@@ -205,7 +205,10 @@ async def search_knowledge(
                     allow_download = r.get('allowDownload', True)
                     if url:
                         if url.startswith('/api/media/file') and allow_download:
-                            formatted_result += f"File Download / View Link: {url}\n"
+                            if any(url.lower().endswith(ext) or f"{ext}?" in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.avif', '.bmp']):
+                                formatted_result += f"Image Link: ![{r['title']}]({url})\n"
+                            else:
+                                formatted_result += f"Download Link: [{r['title']}]({url})\n"
                         elif not url.startswith('file://') and not url.startswith('/api/media/file'):
                             formatted_result += f"Source URL: {url}\n"
                         elif not allow_download:
