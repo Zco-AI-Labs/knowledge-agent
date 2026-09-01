@@ -48,6 +48,32 @@ class RemoteContext:
         return self.raw_context.get("user_privileges") or self.raw_context.get("userPrivileges") or []
 
     @property
+    def base_url(self) -> str:
+        return (
+            self.raw_context.get("base_url")
+            or self.raw_context.get("backend_url")
+            or os.environ.get("BASE_URL")
+            or os.environ.get("HUBSCAPE_BASE_URL")
+            or os.environ.get("HUBSCAPE_BACKEND_URL")
+            or "https://hubscape-geap.web.app"
+        ).rstrip("/")
+
+    @property
+    def api_url(self) -> str:
+        env_api = self.raw_context.get("api_url") or os.environ.get("API_URL") or os.environ.get("HUBSCAPE_API_URL")
+        if env_api:
+            return env_api.rstrip("/")
+        return f"{self.base_url}/api/apis"
+
+    @property
+    def agent_url(self) -> str:
+        env_agent = self.raw_context.get("agent_url") or os.environ.get("AGENT_URL") or os.environ.get("HUBSCAPE_AGENT_URL")
+        if env_agent:
+            return env_agent.rstrip("/")
+        return f"{self.base_url}/api/agents"
+
+
+    @property
     def _db_client(self):
         if self._db is None:
             # Try to get OAuth2 token from Metadata Server
@@ -278,8 +304,12 @@ class RemoteContext:
             with open(template_path, "r", encoding="utf-8") as f:
                 widget_config = json.load(f)
 
-            # Replacements (e.g. {{agent_id}} -> actual agent ID)
+            # Replacements (e.g. {{agent_id}} -> actual agent ID, {{data.key}} -> data values)
             config_str = json.dumps(widget_config).replace("{{agent_id}}", self.agent_id)
+            if data and isinstance(data, dict):
+                for k, v in data.items():
+                    if v is not None:
+                        config_str = config_str.replace(f"{{{{data.{k}}}}}", str(v))
             widget_config = json.loads(config_str)
 
             action_payload = {
@@ -293,7 +323,20 @@ class RemoteContext:
                 }
             }
             self.actions.append(action_payload)
-            return {"status": "success", "message": f"Widget '{widget_template_id}' queued."}
+            directive_response = {
+                "directive": "execute_host_tool",
+                "target_tool": "openAgentWidget",
+                "parameters": {
+                    "widgetId": widget_template_id,
+                    "widgetConfig": widget_config,
+                    "data": data or {},
+                    "styling": self.raw_context.get("styling", {}),
+                    "userPreferences": self.raw_context.get("userPreferences", {})
+                },
+                "status": "success",
+                "message": f"Widget '{widget_template_id}' queued."
+            }
+            return directive_response
         except Exception as e:
             raise RuntimeError(f"Failed to load widget '{widget_template_id}': {str(e)}")
 
@@ -313,7 +356,20 @@ class RemoteContext:
             }
         }
         self.actions.append(action_payload)
-        return {"status": "success", "message": "Custom UI layout queued."}
+        directive_response = {
+            "directive": "execute_host_tool",
+            "target_tool": "openAgentWidget",
+            "parameters": {
+                "widgetId": "generative_custom_ui",
+                "widgetConfig": layout,
+                "data": data or {},
+                "styling": self.raw_context.get("styling", {}),
+                "userPreferences": self.raw_context.get("userPreferences", {})
+            },
+            "status": "success",
+            "message": "Custom UI layout queued."
+        }
+        return directive_response
 
     def close_widget(self, message_id: Optional[str] = None, result_text: Optional[str] = None) -> dict:
         """Registers a CLOSE_AGENT_WIDGET client action directive to close/unmount an active widget."""
@@ -325,7 +381,17 @@ class RemoteContext:
             }
         }
         self.actions.append(action_payload)
-        return {"status": "success", "message": "Close widget directive queued."}
+        directive_response = {
+            "directive": "execute_host_tool",
+            "target_tool": "closeAgentWidget",
+            "parameters": {
+                "messageId": message_id,
+                "resultText": result_text or "✅ Widget closed."
+            },
+            "status": "success",
+            "message": "Close widget directive queued."
+        }
+        return directive_response
 
     def send_otp(self, phone_number: str) -> dict:
         """
@@ -335,9 +401,9 @@ class RemoteContext:
         import httpx
         
         is_cloud = "K_SERVICE" in os.environ or "AIP_PREDICT_PORT" in os.environ
-        backend_url = self.raw_context.get("backend_url") or os.environ.get("HUBSCAPE_BACKEND_URL")
+        backend_url = self.base_url
         
-        if not is_cloud and not backend_url:
+        if not is_cloud and not (self.raw_context.get("backend_url") or os.environ.get("BASE_URL")):
             logger.warning(
                 f"⚠️ Local Dev Bypass: Simulating OTP SMS send to {phone_number}."
             )
@@ -347,7 +413,8 @@ class RemoteContext:
                 "message": "OTP SMS send simulated for local testing. Use code '123456' to verify."
             }
             
-        url = f"{str(backend_url or 'https://hubscape-backend-w3xi4ozhca-uc.a.run.app').rstrip('/')}/api/otp/send"
+        url = f"{backend_url}/api/otp/send"
+
         headers = {}
         cap_token = self.raw_context.get("capability_token")
         if cap_token:
@@ -371,9 +438,9 @@ class RemoteContext:
         import httpx
         
         is_cloud = "K_SERVICE" in os.environ or "AIP_PREDICT_PORT" in os.environ
-        backend_url = self.raw_context.get("backend_url") or os.environ.get("HUBSCAPE_BACKEND_URL")
+        backend_url = self.base_url
         
-        if not is_cloud and not backend_url:
+        if not is_cloud and not (self.raw_context.get("backend_url") or os.environ.get("BASE_URL")):
             logger.warning(
                 f"⚠️ Local Dev Bypass: Verifying simulated OTP for {phone_number}."
             )
@@ -381,7 +448,9 @@ class RemoteContext:
                 return {"success": True, "status": "verified", "message": "Simulated OTP verified successfully."}
             return {"success": False, "status": "invalid", "message": "Simulated OTP verification failed."}
             
-        url = f"{str(backend_url or 'https://hubscape-backend-w3xi4ozhca-uc.a.run.app').rstrip('/')}/api/otp/verify"
+        url = f"{backend_url}/api/otp/verify"
+
+
         headers = {}
         cap_token = self.raw_context.get("capability_token")
         if cap_token:
@@ -453,6 +522,40 @@ class RemoteContext:
             }
         }
 
+    def get_available_agents(self, query: str = None) -> list:
+        """
+        Retrieves the list of whitelisted subagents available in the active session context.
+        """
+        accessible_agents = self.raw_context.get("accessible_agents", [])
+        results = []
+        for agent in accessible_agents:
+            name = agent.get("name") or ""
+            desc = agent.get("description") or ""
+            a2a_url = agent.get("a2aUrl") or ""
+            
+            # Use computed fallback from geap_resource_name if a2aUrl is not present
+            if not a2a_url and agent.get("geap_resource_name"):
+                resource_name = agent.get("geap_resource_name")
+                location = "us-central1"
+                if "/" in resource_name:
+                    parts = resource_name.split("/")
+                    if len(parts) > 3:
+                        location = parts[3]
+                a2a_url = f"https://{location}-aiplatform.googleapis.com/v1/{resource_name}"
+            
+            if query:
+                q = query.lower()
+                if q not in name.lower() and q not in desc.lower():
+                    continue
+            
+            results.append({
+                "id": agent.get("id"),
+                "name": name,
+                "description": desc,
+                "a2aUrl": a2a_url
+            })
+        return results
+
 
 def get_context() -> RemoteContext:
     try:
@@ -465,6 +568,31 @@ def get_context() -> RemoteContext:
             "No active RemoteContext found. "
             "Ensure the tool is executed inside an active context_session."
         )
+
+def get_base_url() -> str:
+    """Returns the platform base URL."""
+    try:
+        return get_context().base_url
+    except Exception:
+        from app.app_utils.env_resolver import get_base_url as _resolve_base_url
+        return _resolve_base_url()
+
+def get_api_url() -> str:
+    """Returns the Modular API gateway base URL ({API_URL}/{api_uuid}/*)."""
+    try:
+        return get_context().api_url
+    except Exception:
+        from app.app_utils.env_resolver import get_api_url as _resolve_api_url
+        return _resolve_api_url()
+
+def get_agent_url() -> str:
+    """Returns the Agent gateway / A2A base URL ({AGENT_URL}/{agent_id}/*)."""
+    try:
+        return get_context().agent_url
+    except Exception:
+        from app.app_utils.env_resolver import get_agent_url as _resolve_agent_url
+        return _resolve_agent_url()
+
 
 @contextlib.contextmanager
 def context_session(context: RemoteContext) -> Generator[None, None, None]:
@@ -735,8 +863,8 @@ def filter_tools_for_scope(*args, **kwargs):
         if org_id is None and len(args) > 2:
             org_id = args[2]
             
-        if org_id is not None:
-            is_org_scope = (hub_id == org_id) or (not hub_id) or (hub_id == "platform")
+        if org_id is not None and org_id != "unknown-org":
+            is_org_scope = (org_id and hub_id == org_id) or (not hub_id) or (hub_id == "platform")
             active_scope = "org" if is_org_scope else "hub"
         else:
             wtype = hub_id or "hub"
@@ -870,4 +998,3 @@ async def resolve_mcp_tools(agent, context):
             
     agent.tools = resolved_tools
     return agent
-

@@ -169,6 +169,7 @@ class GEAPAgentWrapper:
             turn_prefix = ""
             if spatial_context:
                 turn_prefix += f"{spatial_context.strip()}\n"
+            use_grounding = any(getattr(t, "name", getattr(t, "__name__", "")) == "google_maps_grounding" for t in cloned_agent.tools)
             if use_grounding:
                 turn_prefix += (
                     "[LIVE GROUNDING & NAVIGATION DIRECTIVE]\n"
@@ -246,4 +247,3 @@ class GEAPAgentWrapper:
                 pass
                 
             return text_response
-
