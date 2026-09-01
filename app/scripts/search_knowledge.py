@@ -203,17 +203,19 @@ async def search_knowledge(
 
                 formatted_result = ""
                 for idx, r in enumerate(results):
-                    formatted_result += f"--- Result {idx+1}: {r['title']} ---\n"
+                    formatted_result += f"--- Knowledge Item {idx+1}: {r['title']} ---\n"
                     url = r.get('url')
                     allow_download = r.get('allowDownload', True)
                     if url:
                         if url.startswith('/api/media/file') and allow_download:
                             if any(url.lower().endswith(ext) or f"{ext}?" in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.avif', '.bmp']):
-                                formatted_result += f"Image Link: ![{r['title']}]({url})\n"
+                                formatted_result += f"🖼️ Image Preview: ![{r['title']}]({url})\n"
                             else:
-                                formatted_result += f"Download Link: [{r['title']}]({url})\n"
+                                formatted_result += f"📄 Downloadable File: [⬇️ Download {r['title']}]({url})\n"
+                        elif 'maps.google' in url or 'google.com/maps' in url or 'openstreetmap' in url or 'waze.com' in url or 'apple.com/maps' in url:
+                            formatted_result += f"📍 Location & Map Link: [📍 View on Map]({url})\n"
                         elif not url.startswith('file://') and not url.startswith('/api/media/file'):
-                            formatted_result += f"Source URL: {url}\n"
+                            formatted_result += f"🔗 Source / Website Link: [🌐 {r['title']}]({url})\n"
                         elif not allow_download:
                             formatted_result += f"Source: {r['title']} (Internal Grounding Only - Raw File Download Restricted)\n"
                     formatted_result += f"{r['content']}\n\n"
