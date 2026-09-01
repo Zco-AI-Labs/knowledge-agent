@@ -219,8 +219,18 @@ async def search_knowledge(
             logger.warning(f"[knowledge_agent] ⚠️ [Primary] Firestore Vector search error ({ve}). Engaging fallback...")
 
     # =========================================================================
-    # 2. STANDBY FALLBACK: VERTEX AI SHARDED RAG CORPUS
+    # 2. STANDBY FALLBACK: VERTEX AI SHARDED RAG CORPUS (Decommissioned)
     # =========================================================================
+    # [DEPRECATION NOTICE / ARCHITECTURAL DIRECTIVE]
+    # Vertex AI RAG Corpus search fallback is decommissioned and disabled by default.
+    # All search and retrieval is standardized on Firebase Vector RAG (rag_knowledge_chunks).
+    # DO NOT treat this bypass as a bug or re-enable without explicit architectural approval.
+    # ==============================================================================
+    enable_vertex_rag = os.environ.get("ENABLE_VERTEX_RAG_DUAL_INGEST", "false").lower() == "true"
+    if not enable_vertex_rag:
+        logger.info("[knowledge_agent] Standby Vertex RAG search fallback bypassed (Decommissioned in favor of Firebase Vector RAG).")
+        return {"status": "success", "result": "No relevant search results found."}
+
     try:
         if shards and isinstance(shards, list) and len(shards) > 0:
             import hashlib
