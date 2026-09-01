@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import asyncio
 from typing import Optional, Dict, Any, List
 from google.cloud import aiplatform_v1beta1
@@ -56,18 +57,20 @@ async def search_knowledge(
     try:
         platform_ref = db_client.collection('settings').document('platform')
         platform_snap = await asyncio.to_thread(platform_ref.get)
-        if platform_snap.exists:
-            platform_data = platform_snap.to_dict() or {}
-            rag_provider = platform_data.get("rag_provider", "FIRESTORE_VECTOR")
-            shards = platform_data.get("rag_corpus_shards") or []
-            corpus_id = platform_data.get("rag_corpus_id")
+        if platform_snap and hasattr(platform_snap, "exists") and platform_snap.exists:
+            raw_dict = platform_snap.to_dict() if hasattr(platform_snap, "to_dict") else {}
+            if isinstance(raw_dict, dict):
+                platform_data = raw_dict
+                rag_provider = platform_data.get("rag_provider", "FIRESTORE_VECTOR")
+                shards = platform_data.get("rag_corpus_shards") or []
+                corpus_id = platform_data.get("rag_corpus_id")
     except Exception as pe:
         logger.debug(f"[knowledge_agent] Notice reading platform settings: {pe}")
 
     # =========================================================================
     # 1. PRIMARY ENGINE: CLOUD FIRESTORE VECTOR SEARCH (Sub-100ms, Pre-Siloed)
     # =========================================================================
-    if rag_provider == "FIRESTORE_VECTOR":
+    if not isinstance(rag_provider, str) or rag_provider in ("FIRESTORE_VECTOR", "DEFAULT", "ALL"):
         try:
             logger.info(f"[knowledge_agent] [Primary] Executing Firestore Vector Search for hub '{hub_id}'...")
             
@@ -219,7 +222,7 @@ async def search_knowledge(
 
             logger.info("[knowledge_agent] [Primary] 0 results in Firestore chunks. Checking Vertex fallback...")
         except Exception as ve:
-            logger.warning(f"[knowledge_agent] ⚠️ [Primary] Firestore Vector search error ({ve}). Engaging fallback...")
+            logger.error(f"[knowledge_agent] ⚠️ [Primary] Firestore Vector search error: {ve}", exc_info=True)
 
     # =========================================================================
     # 2. STANDBY FALLBACK: VERTEX AI SHARDED RAG CORPUS (Decommissioned)
