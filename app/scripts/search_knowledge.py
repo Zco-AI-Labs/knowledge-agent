@@ -93,8 +93,8 @@ async def search_knowledge(
             elif org_id:
                 vector_query = vector_query.where(filter=FieldFilter("orgId", "==", org_id))
 
-            # Stage 1: Fetch wide 20-candidate pool
-            fetch_limit = min(max(top_k * 4, 20), 40)
+            # Stage 1: Wide Candidate Fetch Pool (60 to 100 chunks for high-density capture)
+            fetch_limit = min(max((top_k or 5) * 6, 60), 100)
             vector_query = vector_query.find_nearest(
                 vector_field="embedding",
                 query_vector=query_vector,
@@ -114,14 +114,44 @@ async def search_knowledge(
                         "url": data.get("sourceUrl") or data.get("url"),
                         "allowDownload": data.get("allowDownload", True),
                         "parentDocId": data.get("parentDocId"),
+                        "chunkIndex": data.get("chunkIndex", 0),
                         "chunkId": s.id
                     })
 
-                # Stage 1.5: Exact Entity & Title Affinity Boost
-                boosted_keys = set()
+                # Stage 1.5: Deterministic Intent Classification & Adaptive Calibration
                 q_clean = query.lower().strip()
                 q_tokens = [w for w in re.findall(r'[a-zA-Z0-9_-]+', q_clean) if len(w) > 2]
                 
+                is_listing_intent = any(k in q_clean for k in [
+                    "list all", "which stores", "which brands", "what are all", "all stores", "all restaurants",
+                    "all brands", "all shops", "directory", "catalog", "overview", "upcoming events", "list of",
+                    "options for", "stores are located", "what stores", "what brands", "all beauty", "all sports",
+                    "what are the", "which international", "top beauty", "top brands"
+                ])
+                is_targeted_fact = any(q_clean.startswith(k) for k in [
+                    "where is", "what is the phone", "phone number", "what time", "hours of", "when does", "contact for"
+                ]) and not is_listing_intent
+
+                if is_listing_intent:
+                    base_k = 16
+                    max_cluster_k = 38
+                    allowed_per_doc = 8
+                elif is_targeted_fact:
+                    base_k = 5
+                    max_cluster_k = 8
+                    allowed_per_doc = 2
+                else:
+                    base_k = 10
+                    max_cluster_k = 25
+                    allowed_per_doc = 4
+
+                # Respect explicit top_k if caller specifically requested custom depth
+                if top_k and top_k != 5:
+                    base_k = top_k
+                    max_cluster_k = max(top_k * 2, max_cluster_k)
+
+                # Stage 2: Exact Entity & Title Affinity Boost
+                boosted_keys = set()
                 boosted_items = []
                 standard_items = []
                 for item in raw_candidates:
@@ -141,24 +171,38 @@ async def search_knowledge(
 
                 ordered_candidates = boosted_items + standard_items
 
-                # Stage 2: Adaptive Document Diversity Reranker
+                # Stage 3: High-Density Cluster Expansion & Token Budget Enforcement
                 results = []
                 doc_counts: Dict[str, int] = {}
+                accumulated_chars = 0
+                MAX_CHAR_BUDGET = 50000  # ~15,000 tokens safety ceiling
+
+                # Determine effective target K based on cluster density
+                has_dense_boosted_cluster = len(boosted_items) >= 8 or is_listing_intent
+                effective_target_k = max_cluster_k if has_dense_boosted_cluster else base_k
+
                 for item in ordered_candidates:
                     doc_key = item["url"] or item["parentDocId"] or item["title"] or item["chunkId"]
                     current_count = doc_counts.get(doc_key, 0)
                     
-                    # Allow up to 4 chunks for exact-match topics, 2 for broad discovery
-                    allowed_max = 4 if doc_key in boosted_keys else 2
-                    if current_count >= allowed_max:
+                    # Allow up to 8 chunks for boosted/directory docs, standard tier otherwise
+                    effective_max_doc = allowed_per_doc if (doc_key in boosted_keys or is_listing_intent) else 3
+                    if current_count >= effective_max_doc:
                         continue
                     
-                    doc_counts[doc_key] = current_count + 1
-                    results.append(item)
-                    if len(results) >= top_k:
+                    chunk_text = item.get("content", "")
+                    if accumulated_chars + len(chunk_text) > MAX_CHAR_BUDGET and len(results) >= base_k:
+                        logger.info(f"[knowledge_agent] 🛡️ Reached token safety ceiling ({accumulated_chars} chars). Finalizing results.")
                         break
 
-                logger.info(f"[knowledge_agent] ✅ [Primary] Firestore Vector Search returned {len(results)} high-signal chunks across {len(doc_counts)} sources.")
+                    doc_counts[doc_key] = current_count + 1
+                    results.append(item)
+                    accumulated_chars += len(chunk_text)
+
+                    if len(results) >= effective_target_k:
+                        break
+
+                logger.info(f"[knowledge_agent] ✅ [Primary] Firestore Vector Search returned {len(results)} high-signal chunks (Target K: {effective_target_k}, Chars: {accumulated_chars}) across {len(doc_counts)} sources.")
 
                 # Telemetry logging to GCP Cloud Logging / BigQuery
                 try:
@@ -213,6 +257,11 @@ async def search_knowledge(
                             else:
                                 formatted_result += f"📄 Downloadable File: [⬇️ Download {r['title']}]({url})\n"
                         elif 'maps.google' in url or 'google.com/maps' in url or 'openstreetmap' in url or 'waze.com' in url or 'apple.com/maps' in url:
+                            # Standardize Google Maps links to direct search query if bare domain
+                            if url.strip() in ['https://maps.google.com', 'https://www.maps.google.com', 'https://google.com/maps', 'https://www.google.com/maps', 'http://maps.google.com', 'http://google.com/maps']:
+                                import urllib.parse
+                                safe_query = urllib.parse.quote_plus(r['title'])
+                                url = f"https://www.google.com/maps/search/?api=1&query={safe_query}"
                             formatted_result += f"📍 Location & Map Link: [📍 View on Map]({url})\n"
                         elif not url.startswith('file://') and not url.startswith('/api/media/file'):
                             formatted_result += f"🔗 Source / Website Link: [🌐 {r['title']}]({url})\n"
